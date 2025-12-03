@@ -23,6 +23,7 @@ class BettingRound:
     _players_acted: set[int] = field(default_factory=set)
     _current_idx: int = 0
     _round_complete: bool = False
+    max_actions: int = 100  # Safety limit to prevent infinite loops
 
     def __post_init__(self) -> None:
         self.min_raise = self.big_blind
@@ -169,6 +170,10 @@ class BettingRound:
 
     def is_complete(self) -> bool:
         """Check if betting round is complete."""
+        # Safety limit to prevent infinite loops
+        if len(self.actions_taken) >= self.max_actions:
+            return True
+
         # Only one player in hand
         in_hand = self._get_players_in_hand()
         if len(in_hand) <= 1:

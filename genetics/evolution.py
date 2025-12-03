@@ -36,6 +36,7 @@ class EvolutionConfig:
 class GenerationStats:
     """Statistics for a single generation."""
 
+    # Existing fitness metrics
     generation: int
     best_fitness: float
     avg_fitness: float
@@ -45,6 +46,31 @@ class GenerationStats:
     games_played: int
     hands_played: int
     mutation_strength: float = 0.0
+
+    # Game dynamics
+    hands_per_game_min: int = 0
+    hands_per_game_max: int = 0
+    hands_per_game_avg: float = 0.0
+    hands_per_game_std: float = 0.0
+    actions_per_hand: float = 0.0
+    showdown_rate: float = 0.0
+    all_in_rate: float = 0.0
+    rounds_reached: dict[str, float] | None = None  # % distribution
+
+    # Agent behavior (population averages)
+    avg_vpip: float = 0.0
+    avg_pfr: float = 0.0
+    avg_aggression_factor: float = 0.0
+    avg_fold_rate: float = 0.0
+
+    # Outcome stats
+    winning_hand_distribution: dict[str, float] | None = None  # % distribution
+    avg_pot_size: float = 0.0
+    bluff_success_rate: float = 0.0
+
+    # Performance
+    time_seconds: float = 0.0
+    actions_per_second: float = 0.0
 
 
 class EvolutionEngine:
@@ -117,6 +143,23 @@ class EvolutionEngine:
         if isinstance(self.mutation, AdaptiveMutation):
             mutation_strength = self.mutation.mutation_strength
 
+        # Convert rounds_reached counts to percentages
+        rounds_reached_pct = None
+        if "rounds_reached" in eval_stats and eval_stats["total_hands"] > 0:
+            total = eval_stats["total_hands"]
+            rounds_reached_pct = {
+                k: v / total for k, v in eval_stats["rounds_reached"].items()
+            }
+
+        # Convert winning hands counts to percentages
+        winning_hands_pct = None
+        if "winning_hands" in eval_stats:
+            total_showdowns = sum(eval_stats["winning_hands"].values())
+            if total_showdowns > 0:
+                winning_hands_pct = {
+                    k: v / total_showdowns for k, v in eval_stats["winning_hands"].items()
+                }
+
         stats = GenerationStats(
             generation=self.population.generation,
             best_fitness=pop_stats["best_fitness"],
@@ -127,6 +170,27 @@ class EvolutionEngine:
             games_played=eval_stats["total_games"],
             hands_played=eval_stats["total_hands"],
             mutation_strength=mutation_strength,
+            # New game dynamics stats
+            hands_per_game_min=eval_stats.get("hands_per_game_min", 0),
+            hands_per_game_max=eval_stats.get("hands_per_game_max", 0),
+            hands_per_game_avg=eval_stats.get("avg_hands_per_game", 0.0),
+            hands_per_game_std=eval_stats.get("hands_per_game_std", 0.0),
+            actions_per_hand=eval_stats.get("actions_per_hand", 0.0),
+            showdown_rate=eval_stats.get("showdown_rate", 0.0),
+            all_in_rate=eval_stats.get("all_in_rate", 0.0),
+            rounds_reached=rounds_reached_pct,
+            # Agent behavior stats (placeholder - would need per-agent tracking)
+            avg_vpip=eval_stats.get("avg_vpip", 0.0),
+            avg_pfr=eval_stats.get("avg_pfr", 0.0),
+            avg_aggression_factor=eval_stats.get("avg_aggression_factor", 0.0),
+            avg_fold_rate=eval_stats.get("avg_fold_rate", 0.0),
+            # Outcome stats
+            winning_hand_distribution=winning_hands_pct,
+            avg_pot_size=eval_stats.get("avg_pot_size", 0.0),
+            bluff_success_rate=eval_stats.get("bluff_success_rate", 0.0),
+            # Performance stats
+            time_seconds=eval_stats.get("time_seconds", 0.0),
+            actions_per_second=eval_stats.get("actions_per_second", 0.0),
         )
         self.history.append(stats)
 
@@ -254,6 +318,24 @@ class EvolutionEngine:
                     "games_played": s.games_played,
                     "hands_played": s.hands_played,
                     "mutation_strength": s.mutation_strength,
+                    # New stats
+                    "hands_per_game_min": s.hands_per_game_min,
+                    "hands_per_game_max": s.hands_per_game_max,
+                    "hands_per_game_avg": s.hands_per_game_avg,
+                    "hands_per_game_std": s.hands_per_game_std,
+                    "actions_per_hand": s.actions_per_hand,
+                    "showdown_rate": s.showdown_rate,
+                    "all_in_rate": s.all_in_rate,
+                    "rounds_reached": s.rounds_reached,
+                    "avg_vpip": s.avg_vpip,
+                    "avg_pfr": s.avg_pfr,
+                    "avg_aggression_factor": s.avg_aggression_factor,
+                    "avg_fold_rate": s.avg_fold_rate,
+                    "winning_hand_distribution": s.winning_hand_distribution,
+                    "avg_pot_size": s.avg_pot_size,
+                    "bluff_success_rate": s.bluff_success_rate,
+                    "time_seconds": s.time_seconds,
+                    "actions_per_second": s.actions_per_second,
                 }
                 for s in self.history
             ],
@@ -296,6 +378,24 @@ class EvolutionEngine:
                 games_played=s["games_played"],
                 hands_played=s["hands_played"],
                 mutation_strength=s.get("mutation_strength", 0),
+                # New stats (with defaults for backward compatibility)
+                hands_per_game_min=s.get("hands_per_game_min", 0),
+                hands_per_game_max=s.get("hands_per_game_max", 0),
+                hands_per_game_avg=s.get("hands_per_game_avg", 0.0),
+                hands_per_game_std=s.get("hands_per_game_std", 0.0),
+                actions_per_hand=s.get("actions_per_hand", 0.0),
+                showdown_rate=s.get("showdown_rate", 0.0),
+                all_in_rate=s.get("all_in_rate", 0.0),
+                rounds_reached=s.get("rounds_reached"),
+                avg_vpip=s.get("avg_vpip", 0.0),
+                avg_pfr=s.get("avg_pfr", 0.0),
+                avg_aggression_factor=s.get("avg_aggression_factor", 0.0),
+                avg_fold_rate=s.get("avg_fold_rate", 0.0),
+                winning_hand_distribution=s.get("winning_hand_distribution"),
+                avg_pot_size=s.get("avg_pot_size", 0.0),
+                bluff_success_rate=s.get("bluff_success_rate", 0.0),
+                time_seconds=s.get("time_seconds", 0.0),
+                actions_per_second=s.get("actions_per_second", 0.0),
             )
             for s in state["history"]
         ]

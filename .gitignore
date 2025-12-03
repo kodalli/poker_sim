@@ -16,3 +16,13 @@ plots/
 # IDE
 .idea/
 .vscode/
+
+# OS files
+.DS_Store
+
+# Environment
+.env
+.env.local
+
+# Logs
+*.log

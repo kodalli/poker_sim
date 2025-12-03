@@ -15,6 +15,21 @@ if TYPE_CHECKING:
 
 
 @dataclass
+class HandMetrics:
+    """Metrics collected during a single hand."""
+
+    total_actions: int = 0
+    actions_by_round: dict[str, int] = field(default_factory=dict)
+    round_reached: str = "preflop"
+    went_to_showdown: bool = False
+    had_all_in: bool = False
+    pot_size: int = 0
+    winning_hand_rank: str | None = None
+    # Per-player action tracking for behavior stats
+    player_actions: dict[int, dict[str, int]] = field(default_factory=dict)
+
+
+@dataclass
 class HandResult:
     """Result of a completed hand."""
 
@@ -24,6 +39,7 @@ class HandResult:
     showdown_hands: dict[int, EvaluatedHand] | None  # If showdown occurred
     winning_hand: EvaluatedHand | None
     all_folded: bool  # True if everyone folded to one player
+    metrics: HandMetrics = field(default_factory=HandMetrics)
 
 
 class TexasHoldemGame:
@@ -55,6 +71,10 @@ class TexasHoldemGame:
 
         # Track initial chips for calculating changes
         self._initial_chips = {p.id: p.chips for p in players}
+
+        # Metrics tracking
+        self._metrics = HandMetrics()
+        self._metrics.player_actions = {p.id: {"raises": 0, "calls": 0, "folds": 0, "checks": 0} for p in players}
 
     def _get_active_players(self) -> list[Player]:
         """Get players still active in the hand."""
@@ -232,6 +252,25 @@ class TexasHoldemGame:
                 )
             )
 
+            # Track metrics
+            self._metrics.total_actions += 1
+            round_name = self.current_round.name.lower()  # "pre_flop", "flop", etc.
+            self._metrics.actions_by_round[round_name] = self._metrics.actions_by_round.get(round_name, 0) + 1
+
+            # Track per-player action types
+            if action.action_type == ActionType.RAISE:
+                self._metrics.player_actions[player.id]["raises"] += 1
+            elif action.action_type == ActionType.CALL:
+                self._metrics.player_actions[player.id]["calls"] += 1
+            elif action.action_type == ActionType.FOLD:
+                self._metrics.player_actions[player.id]["folds"] += 1
+            elif action.action_type == ActionType.CHECK:
+                self._metrics.player_actions[player.id]["checks"] += 1
+
+            # Check for all-in
+            if player.chips == 0 and player.status == PlayerStatus.ALL_IN:
+                self._metrics.had_all_in = True
+
             # Check if only one player remains
             if betting.only_one_player_remaining():
                 return False
@@ -279,11 +318,18 @@ class TexasHoldemGame:
         """Determine winners at showdown."""
         active_players = [p for p in self.players if p.is_in_hand()]
 
+        # Record final pot size
+        self._metrics.pot_size = self.pot_manager.total() + sum(p.current_bet for p in self.players)
+
         # If only one player, they win without showdown
         if len(active_players) == 1:
             winner = active_players[0]
             winnings = self.pot_manager.distribute([[winner.id]] * len(self.pot_manager.pots))
             winner.win(winnings.get(winner.id, 0))
+
+            # Update metrics - no showdown
+            self._metrics.went_to_showdown = False
+            self._metrics.winning_hand_rank = None
 
             return HandResult(
                 winners=[winner.id],
@@ -294,6 +340,7 @@ class TexasHoldemGame:
                 showdown_hands=None,
                 winning_hand=None,
                 all_folded=True,
+                metrics=self._metrics,
             )
 
         # Evaluate all hands
@@ -333,6 +380,11 @@ class TexasHoldemGame:
         all_winners = list(winnings.keys())
         best_overall = max(hands.values()) if hands else None
 
+        # Update metrics - went to showdown
+        self._metrics.went_to_showdown = True
+        if best_overall:
+            self._metrics.winning_hand_rank = best_overall.rank.name.lower()
+
         return HandResult(
             winners=all_winners,
             winnings=winnings,
@@ -342,6 +394,7 @@ class TexasHoldemGame:
             showdown_hands=hands,
             winning_hand=best_overall,
             all_folded=False,
+            metrics=self._metrics,
         )
 
     def play(self, agents: dict[int, "BaseAgent"]) -> HandResult:
@@ -369,6 +422,7 @@ class TexasHoldemGame:
 
         # Pre-flop betting
         self.current_round = GameRound.PRE_FLOP
+        self._metrics.round_reached = "preflop"
         if not self._run_betting_round(agents):
             return self._determine_winners()
 
@@ -377,6 +431,7 @@ class TexasHoldemGame:
 
         # Flop
         self._deal_flop()
+        self._metrics.round_reached = "flop"
         if len(active_players) > 1:
             if not self._run_betting_round(agents):
                 return self._determine_winners()
@@ -384,6 +439,7 @@ class TexasHoldemGame:
 
         # Turn
         self._deal_turn()
+        self._metrics.round_reached = "turn"
         if len(active_players) > 1:
             if not self._run_betting_round(agents):
                 return self._determine_winners()
@@ -391,10 +447,12 @@ class TexasHoldemGame:
 
         # River
         self._deal_river()
+        self._metrics.round_reached = "river"
         if len(active_players) > 1:
             if not self._run_betting_round(agents):
                 return self._determine_winners()
 
         # Showdown
         self.current_round = GameRound.SHOWDOWN
+        self._metrics.round_reached = "showdown"
         return self._determine_winners()
