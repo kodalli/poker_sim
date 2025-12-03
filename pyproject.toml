@@ -1,0 +1,48 @@
+[project]
+name = "poker-sim"
+version = "0.1.0"
+description = "Texas Hold'em poker simulation with genetic algorithm AI evolution"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "torch>=2.4.0",
+    "numpy>=2.0.0",
+    "tqdm>=4.66.0",
+    "pydantic>=2.8.0",
+    "typer>=0.12.0",
+    "rich>=13.7.0",
+    "matplotlib>=3.9.0",
+    "pyyaml>=6.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-cov>=5.0.0",
+    "ruff>=0.5.0",
+    "mypy>=1.11.0",
+]
+
+[project.scripts]
+poker-sim = "main:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["poker", "agents", "genetics", "simulation", "config", "utils"]
+
+[tool.hatch.build.targets.sdist]
+include = ["poker", "agents", "genetics", "simulation", "config", "utils", "main.py"]
