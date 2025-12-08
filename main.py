@@ -448,6 +448,15 @@ def train_rl_jax(
     )
     save_metadata(model, metadata)
 
+    # Generate training plots
+    csv_path = Path(tensorboard) / "metrics.csv"
+    if csv_path.exists():
+        from training.logging import plot_ppo_training
+        plots_dir = Path(f"models/{model}/plots")
+        console.print("\nGenerating training plots...")
+        plot_ppo_training(csv_path, plots_dir)
+        console.print(f"Plots saved to: [cyan]{plots_dir}/[/cyan]")
+
     console.print(f"\n[green]Training complete![/green]")
     console.print(f"Model saved to: models/{model}/")
     console.print(f"Steps/sec: [cyan]{metrics.steps_per_second:.0f}[/cyan]")

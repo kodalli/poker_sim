@@ -1,5 +1,6 @@
 """JAX-accelerated training loop for poker RL."""
 
+import logging
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -66,8 +67,8 @@ class JAXTrainingConfig:
     checkpoint_every: int = 50_000
     checkpoint_dir: str = "models/jax/checkpoints"
 
-    # Logging
-    log_every: int = 1000
+    # Logging (log_every is in updates, not steps)
+    log_every: int = 1  # Log every N updates
     tensorboard_dir: str | None = "logs/jax"
 
     # Game settings
@@ -143,13 +144,25 @@ class JAXTrainer:
         self.optimizer = create_optimizer(self.ppo_config)
         self.opt_state = self.optimizer.init(self.params)
 
-        # Logger
+        # Logger (TensorBoard + CSV for plotting)
         self.logger: MetricsLogger | None = None
+        self.file_logger: logging.Logger | None = None
         if self.training_config.tensorboard_dir:
+            log_dir = Path(self.training_config.tensorboard_dir)
             self.logger = MetricsLogger(
-                Path(self.training_config.tensorboard_dir),
+                log_dir,
                 use_tensorboard=True,
+                use_csv=True,  # Enable CSV for plotting
             )
+            # File logger for training progress
+            log_file = log_dir / "training.log"
+            file_handler = logging.FileHandler(log_file, mode="w")
+            file_handler.setFormatter(
+                logging.Formatter("%(asctime)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+            )
+            self.file_logger = logging.getLogger(f"jax_trainer_{id(self)}")
+            self.file_logger.setLevel(logging.INFO)
+            self.file_logger.addHandler(file_handler)
 
         # Print info
         num_params = count_parameters(self.params)
@@ -384,7 +397,7 @@ class JAXTrainer:
                         sps=f"{collect_metrics.steps_per_second:.0f}",
                     )
 
-                if self.logger and global_step % config.log_every == 0:
+                if self.logger and (update_idx + 1) % config.log_every == 0:
                     self.logger.log(global_step, {
                         "reward/avg": collect_metrics.avg_reward,
                         "reward/games_completed": collect_metrics.games_completed,
@@ -396,6 +409,14 @@ class JAXTrainer:
                         "perf/steps_per_second": collect_metrics.steps_per_second,
                         "perf/games_per_second": collect_metrics.games_per_second,
                     })
+
+                # File logging (persist progress for long runs)
+                if self.file_logger and update_idx % 10 == 0:
+                    self.file_logger.info(
+                        f"step={global_step:>8} | rew={collect_metrics.avg_reward:>7.3f} | "
+                        f"pol={ppo_metrics.policy_loss:>7.4f} | val={ppo_metrics.value_loss:>7.4f} | "
+                        f"ent={ppo_metrics.entropy:>6.3f} | sps={collect_metrics.steps_per_second:>5.0f}"
+                    )
 
                 # Checkpointing
                 if global_step % config.checkpoint_every == 0:

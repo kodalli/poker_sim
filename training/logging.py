@@ -206,3 +206,107 @@ def plot_training_curves(
         plt.show()
 
     plt.close()
+
+
+def plot_ppo_training(
+    csv_path: Path | str,
+    output_dir: Path | str,
+) -> None:
+    """Generate PPO training plots from CSV metrics.
+
+    Creates 4 focused plots:
+    1. losses.png - Policy loss, value loss, entropy
+    2. rewards.png - Average reward over training
+    3. ppo_diagnostics.png - Approximate KL and clip fraction
+    4. performance.png - Steps/sec and games/sec
+
+    Args:
+        csv_path: Path to metrics.csv file
+        output_dir: Directory to save plots
+    """
+    import matplotlib.pyplot as plt
+
+    metrics = load_csv_metrics(csv_path)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    steps = metrics.get("step", [])
+    if not steps:
+        print("Warning: No data found in CSV file")
+        return
+
+    # Plot style
+    plt.style.use("seaborn-v0_8-darkgrid")
+
+    # 1. Loss curves
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    loss_metrics = [
+        ("loss/policy", "Policy Loss", "tab:blue"),
+        ("loss/value", "Value Loss", "tab:orange"),
+        ("loss/entropy", "Entropy", "tab:green"),
+    ]
+    for ax, (key, title, color) in zip(axes, loss_metrics):
+        if key in metrics:
+            ax.plot(steps, metrics[key], color=color, linewidth=1.5)
+            ax.set_xlabel("Step")
+            ax.set_ylabel(title)
+            ax.set_title(title)
+            ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_dir / "losses.png", dpi=150, bbox_inches="tight")
+    plt.close()
+
+    # 2. Reward curve
+    fig, ax = plt.subplots(figsize=(10, 5))
+    if "reward/avg" in metrics:
+        ax.plot(steps, metrics["reward/avg"], color="tab:green", linewidth=1.5)
+        ax.set_xlabel("Step")
+        ax.set_ylabel("Average Reward")
+        ax.set_title("Training Reward")
+        ax.grid(True, alpha=0.3)
+        # Add smoothed line if enough data
+        if len(steps) > 20:
+            import numpy as np
+            window = min(20, len(steps) // 5)
+            smoothed = np.convolve(metrics["reward/avg"], np.ones(window)/window, mode="valid")
+            ax.plot(steps[window-1:], smoothed, color="darkgreen", linewidth=2, label="Smoothed")
+            ax.legend()
+    plt.tight_layout()
+    plt.savefig(output_dir / "rewards.png", dpi=150, bbox_inches="tight")
+    plt.close()
+
+    # 3. PPO diagnostics
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    diag_metrics = [
+        ("ppo/approx_kl", "Approximate KL", "tab:purple"),
+        ("ppo/clip_fraction", "Clip Fraction", "tab:red"),
+    ]
+    for ax, (key, title, color) in zip(axes, diag_metrics):
+        if key in metrics:
+            ax.plot(steps, metrics[key], color=color, linewidth=1.5)
+            ax.set_xlabel("Step")
+            ax.set_ylabel(title)
+            ax.set_title(title)
+            ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_dir / "ppo_diagnostics.png", dpi=150, bbox_inches="tight")
+    plt.close()
+
+    # 4. Performance
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    perf_metrics = [
+        ("perf/steps_per_second", "Steps/Second", "tab:blue"),
+        ("perf/games_per_second", "Games/Second", "tab:orange"),
+    ]
+    for ax, (key, title, color) in zip(axes, perf_metrics):
+        if key in metrics:
+            ax.plot(steps, metrics[key], color=color, linewidth=1.5)
+            ax.set_xlabel("Step")
+            ax.set_ylabel(title)
+            ax.set_title(title)
+            ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_dir / "performance.png", dpi=150, bbox_inches="tight")
+    plt.close()
+
+    print(f"Saved 4 plots to {output_dir}/")
