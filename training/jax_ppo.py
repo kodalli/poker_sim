@@ -160,16 +160,19 @@ def ppo_loss(
     )
     values = values.squeeze(-1)
 
-    # Mask invalid actions
-    masked_logits = jnp.where(valid_masks, action_logits, -1e9)
+    # Mask invalid actions (use -1e8 for better numerical stability)
+    masked_logits = jnp.where(valid_masks, action_logits, -1e8)
 
     # Compute new log probs
     log_probs = jax.nn.log_softmax(masked_logits, axis=-1)
     new_log_probs = jnp.take_along_axis(log_probs, actions[:, None], axis=1).squeeze(-1)
 
-    # Compute entropy
+    # Compute entropy with numerical stability
+    # Note: No need to multiply by valid_masks again - softmax already zeroes invalid actions
     probs = jax.nn.softmax(masked_logits, axis=-1)
-    entropy = -jnp.sum(probs * log_probs * valid_masks, axis=-1).mean()
+    # Add epsilon to avoid log(0) for invalid actions (their probs are ~0 but not exactly 0)
+    safe_log_probs = jnp.log(probs + 1e-10)
+    entropy = -jnp.sum(probs * safe_log_probs, axis=-1).mean()
 
     # PPO policy loss
     ratio = jnp.exp(new_log_probs - old_log_probs)

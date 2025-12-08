@@ -71,8 +71,15 @@ class RolloutBuffer:
 
         Args:
             last_value: Value estimate for the state after last experience
-                       (0 if episode ended, otherwise bootstrap)
+                       (0 if episode ended, otherwise bootstrap from value network)
             normalize_advantages: Whether to normalize advantages
+
+        Note:
+            Each poker hand is treated as a complete episode. When `done=True`,
+            the episode terminates and we don't bootstrap (next_value=0).
+            If you want multi-hand sessions with value bootstrapping between
+            hands, you'd need to add a `truncated` flag to distinguish
+            "hand ended" from "session ended".
         """
         n = len(self.experiences)
         if n == 0:

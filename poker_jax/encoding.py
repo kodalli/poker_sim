@@ -63,31 +63,33 @@ def encode_state(state: GameState, player_id: int = 0) -> Array:
     position = jnp.stack([is_button, 1 - is_button], axis=1)  # [N, 2]
 
     # === Chip/Bet information (normalized by starting chips) ===
+    # All numeric features are normalized to approximately [0, 2] range
+    # Values > 1.0 can occur when a player has won chips
     norm = state.starting_chips.astype(jnp.float32)
 
     # Current pot (including current round bets)
     total_pot = state.pot + state.bets[:, 0] + state.bets[:, 1]
-    pot_norm = (total_pot / norm)[:, None]  # [N, 1]
+    pot_norm = jnp.clip(total_pot / norm, 0.0, 4.0)[:, None]  # [N, 1], clamp to prevent extreme values
 
     # My chips
     my_chips = state.chips[:, player_id]
-    my_chips_norm = (my_chips / norm)[:, None]  # [N, 1]
+    my_chips_norm = jnp.clip(my_chips / norm, 0.0, 4.0)[:, None]  # [N, 1]
 
     # Opponent chips
     opp_chips = state.chips[:, opp_id]
-    opp_chips_norm = (opp_chips / norm)[:, None]  # [N, 1]
+    opp_chips_norm = jnp.clip(opp_chips / norm, 0.0, 4.0)[:, None]  # [N, 1]
 
     # My current bet
     my_bet = state.bets[:, player_id]
-    my_bet_norm = (my_bet / norm)[:, None]  # [N, 1]
+    my_bet_norm = jnp.clip(my_bet / norm, 0.0, 4.0)[:, None]  # [N, 1]
 
     # Opponent current bet
     opp_bet = state.bets[:, opp_id]
-    opp_bet_norm = (opp_bet / norm)[:, None]  # [N, 1]
+    opp_bet_norm = jnp.clip(opp_bet / norm, 0.0, 4.0)[:, None]  # [N, 1]
 
     # Amount to call
     to_call = jnp.maximum(opp_bet - my_bet, 0)
-    to_call_norm = (to_call / norm)[:, None]  # [N, 1]
+    to_call_norm = jnp.clip(to_call / norm, 0.0, 4.0)[:, None]  # [N, 1]
 
     # === Valid actions ===
     # Compute valid action mask

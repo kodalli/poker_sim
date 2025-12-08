@@ -64,8 +64,14 @@ class ActorCriticMLP(nn.Module):
 class ActorCriticTransformer(nn.Module):
     """Transformer-based actor-critic for poker.
 
-    Treats cards as tokens and uses self-attention.
-    Reserved for v3 architecture.
+    WARNING: EXPERIMENTAL - This implementation is currently broken!
+    The self-attention operates on a single token (the entire observation),
+    which makes it equivalent to a simple linear layer. For meaningful
+    self-attention, the input should be tokenized (e.g., per card).
+
+    Use ActorCriticMLP instead for production training.
+
+    Reserved for v3 architecture with proper tokenization.
     """
 
     num_heads: int = 4
@@ -154,11 +160,19 @@ def init_network(
     Args:
         network: Flax module
         rng_key: PRNG key for initialization
-        obs_dim: Observation dimension
+        obs_dim: Observation dimension (should match OBS_DIM from encoding)
 
     Returns:
         Initialized parameters
+
+    Raises:
+        AssertionError: If obs_dim doesn't match expected OBS_DIM
     """
+    if obs_dim != OBS_DIM:
+        raise ValueError(
+            f"obs_dim mismatch: got {obs_dim}, expected {OBS_DIM}. "
+            f"Ensure encoding and network dimensions are consistent."
+        )
     dummy_input = jnp.zeros((1, obs_dim))
     variables = network.init(rng_key, dummy_input, training=False)
     return variables["params"]
@@ -210,22 +224,30 @@ def sample_action(
         rng_key: PRNG key
         action_logits: [batch, num_actions] raw logits
         valid_mask: [batch, num_actions] bool mask (True = valid)
-        temperature: Sampling temperature
+        temperature: Sampling temperature (only affects sampling, not log_probs)
 
     Returns:
         Tuple of (actions [batch], log_probs [batch])
+
+    Note:
+        Log probabilities are computed from UNSCALED logits to ensure correct
+        PPO importance weights. Temperature only affects the sampling distribution,
+        not the returned log_probs used for training.
     """
     # Mask invalid actions with large negative value
     masked_logits = jnp.where(valid_mask, action_logits, -1e9)
 
-    # Apply temperature
+    # Compute log probabilities from UNSCALED masked logits
+    # This is critical for correct PPO importance sampling ratios
+    log_probs = jax.nn.log_softmax(masked_logits, axis=-1)
+
+    # Apply temperature ONLY for sampling (exploration)
     scaled_logits = masked_logits / temperature
 
-    # Sample from categorical distribution
+    # Sample from categorical distribution using temperature-scaled logits
     actions = jax.random.categorical(rng_key, scaled_logits)
 
-    # Compute log probability
-    log_probs = jax.nn.log_softmax(scaled_logits)
+    # Extract log_probs for selected actions (from UNSCALED distribution)
     action_log_probs = jnp.take_along_axis(
         log_probs, actions[:, None], axis=1
     ).squeeze(-1)

@@ -91,16 +91,20 @@ class RLAgent(BaseAgent):
                 mask[idx] = 1.0
         return mask
 
-    def start_hand(self, hole_cards: tuple[Card, Card], initial_chips: int) -> None:
+    def start_hand(
+        self, hole_cards: tuple[Card, Card], initial_chips: int, blind_amount: int = 0
+    ) -> None:
         """Called at the start of a hand to initialize tracking.
 
         Args:
             hole_cards: Player's hole cards for this hand
             initial_chips: Chips at start of hand
+            blind_amount: Blind already posted (SB or BB amount)
         """
         self.collector.clear()
         self.collector.hole_cards = hole_cards
-        self._chips_invested = 0
+        # Initialize with blind amount already invested
+        self._chips_invested = blind_amount
         self._initial_chips = initial_chips
 
     def decide(self, table_state: TableState) -> PlayerAction:
@@ -142,11 +146,14 @@ class RLAgent(BaseAgent):
 
         action_type = self.ACTION_MAP[action_idx.item()]
 
-        # Validate action
+        # Validate action - if sampled action is invalid, fall back to first valid
         if action_type not in table_state.valid_actions:
             action_type = table_state.valid_actions[0] if table_state.valid_actions else ActionType.FOLD
             action_idx = torch.tensor(self.REVERSE_ACTION_MAP[action_type], device=self.device)
-            action_log_prob = action_dist.log_prob(action_idx)
+            # Use uniform probability over valid actions for fallback
+            # This is more principled than using the masked distribution
+            num_valid = len(table_state.valid_actions)
+            action_log_prob = torch.log(torch.tensor(1.0 / max(num_valid, 1), device=self.device))
 
         # Create action
         bet_frac = bet_fraction.item()
