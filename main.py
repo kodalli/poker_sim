@@ -210,6 +210,125 @@ def train(
     console.print(f"Plots saved to: {plots_dir}/")
 
 
+@app.command(name="train-rl")
+def train_rl(
+    model: str = typer.Option("v2", "--model", "-m", help="Model version (e.g., v2)"),
+    games: int = typer.Option(100_000, "--games", "-g", help="Total games to train"),
+    games_per_update: int = typer.Option(100, "--batch", "-b", help="Games per PPO update"),
+    lr: float = typer.Option(3e-4, "--lr", help="Learning rate"),
+    opponent: str = typer.Option("mixed", "--opponent", "-o", help="Opponent type: random, tag, self, mixed"),
+    description: str = typer.Option("", "--desc", "-d", help="Model description"),
+    seed: Optional[int] = typer.Option(None, "--seed", "-s", help="Random seed"),
+    cpu: bool = typer.Option(False, "--cpu", help="Force CPU (disable CUDA)"),
+) -> None:
+    """Train poker AI using PPO reinforcement learning."""
+    from agents.neural.network import ActorCriticMLP, NetworkConfig
+    from training.ppo import PPOConfig
+    from training.trainer import RLTrainer, TrainingConfig
+
+    console.print("\n[bold blue]RL Training (PPO)[/bold blue]")
+    console.print("=" * 50)
+
+    # Handle model versioning
+    if version_exists(model):
+        console.print(f"\n[yellow]Model {model} already exists![/yellow]")
+        console.print("Options:")
+        console.print("  1. Overwrite existing model")
+        console.print(f"  2. Create new version ({get_next_version()})")
+        console.print("  3. Cancel")
+
+        choice = typer.prompt("Choose option", default="2")
+
+        if choice == "1":
+            console.print(f"[yellow]Will overwrite {model}[/yellow]")
+        elif choice == "2":
+            model = get_next_version()
+            console.print(f"[green]Creating new version: {model}[/green]")
+        else:
+            console.print("[red]Cancelled.[/red]")
+            raise typer.Exit(0)
+
+    # Create model directory
+    create_version(model, exist_ok=True)
+    checkpoint_dir = str(get_checkpoint_dir(model))
+
+    # Setup device
+    device = get_device(prefer_cuda=not cpu)
+    console.print(f"Model version: [cyan]{model}[/cyan]")
+    console.print(f"Device: [green]{device}[/green]")
+
+    if device.type == "cuda":
+        props = torch.cuda.get_device_properties(0)
+        console.print(f"GPU: [green]{props.name}[/green] ({props.total_memory / 1024**3:.1f} GB)")
+
+    # Create configurations
+    network_config = NetworkConfig(hidden_dims=(256, 128, 64))
+
+    ppo_config = PPOConfig(
+        learning_rate=lr,
+        gamma=0.99,
+        lambda_=0.95,
+        epsilon=0.2,
+        ppo_epochs=4,
+        batch_size=64,
+        entropy_coef=0.01,
+        value_coef=0.5,
+    )
+
+    training_config = TrainingConfig(
+        total_games=games,
+        games_per_update=games_per_update,
+        eval_every=1000,
+        checkpoint_every=5000,
+        log_every=100,
+        opponent_type=opponent,
+        model_version=model,
+        checkpoint_dir=checkpoint_dir,
+    )
+
+    # Create network and trainer
+    network = ActorCriticMLP(network_config)
+    console.print(f"Network parameters: [cyan]{network.num_parameters():,}[/cyan]")
+
+    trainer = RLTrainer(
+        network=network,
+        ppo_config=ppo_config,
+        training_config=training_config,
+        device=device,
+        console=console,
+        seed=seed,
+    )
+
+    console.print(f"\n[bold]Starting RL training for {games:,} games...[/bold]\n")
+
+    try:
+        stats = trainer.train(show_progress=True)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Training interrupted. Saving checkpoint...[/yellow]")
+        trainer.save_checkpoint(f"{checkpoint_dir}/interrupted.pt")
+
+    # Save metadata
+    metadata = create_metadata(
+        version=model,
+        architecture="actor_critic",
+        generations=stats.updates,  # Use updates as "generations"
+        population_size=1,  # RL uses single agent
+        best_fitness=stats.win_rate,  # Use win rate as fitness
+        description=description or f"RL training with PPO - {games:,} games",
+        config={
+            "hidden_dims": list(network_config.hidden_dims),
+            "learning_rate": lr,
+            "games_trained": games,
+            "opponent_type": opponent,
+            "training_method": "ppo",
+        },
+    )
+    save_metadata(model, metadata)
+
+    console.print(f"\n[green]Training complete![/green]")
+    console.print(f"Model saved to: models/{model}/")
+
+
 @app.command()
 def evaluate(
     checkpoint: str = typer.Argument(..., help="Path to checkpoint file"),

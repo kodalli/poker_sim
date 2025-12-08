@@ -309,6 +309,114 @@ class ResidualBlock(nn.Module):
         return self.norm(x + self.net(x))
 
 
+class ActorCriticMLP(PokerNetwork):
+    """MLP with separate actor (policy) and critic (value) heads for RL training.
+
+    The actor outputs action logits and bet fraction (policy).
+    The critic outputs a state value estimate (for advantage computation).
+    """
+
+    def __init__(self, config: NetworkConfig | None = None) -> None:
+        super().__init__(config)
+
+        # Build shared feature extractor (backbone)
+        layers: list[nn.Module] = []
+        prev_dim = self.config.input_dim
+
+        for hidden_dim in self.config.hidden_dims:
+            layers.extend(
+                [
+                    nn.Linear(prev_dim, hidden_dim),
+                    nn.LayerNorm(hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(self.config.dropout),
+                ]
+            )
+            prev_dim = hidden_dim
+
+        self.feature_extractor = nn.Sequential(*layers)
+
+        # Actor head - outputs action logits
+        self.action_head = nn.Linear(prev_dim, self.config.num_actions)
+
+        # Bet sizing head - outputs fraction of max raise (0-1)
+        self.bet_head = nn.Sequential(
+            nn.Linear(prev_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+            nn.Sigmoid(),
+        )
+
+        # Critic head - outputs state value estimate
+        self.value_head = nn.Sequential(
+            nn.Linear(prev_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        """Initialize weights."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Forward pass.
+
+        Args:
+            x: Input tensor of shape (batch, input_dim)
+
+        Returns:
+            action_logits: (batch, num_actions) - raw logits for actions
+            bet_fraction: (batch, 1) - bet size as fraction of max (0-1)
+            value: (batch, 1) - state value estimate
+        """
+        features = self.feature_extractor(x)
+        action_logits = self.action_head(features)
+        bet_fraction = self.bet_head(features)
+        value = self.value_head(features)
+        return action_logits, bet_fraction, value
+
+    def get_policy(
+        self, x: torch.Tensor, valid_mask: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Get action probabilities and bet fraction (policy only).
+
+        Args:
+            x: Input tensor
+            valid_mask: Binary mask of valid actions (1 = valid)
+
+        Returns:
+            action_probs: Probability distribution over actions
+            bet_fraction: Bet sizing fraction
+        """
+        action_logits, bet_fraction, _ = self(x)
+
+        if valid_mask is not None:
+            action_logits = action_logits.masked_fill(valid_mask == 0, -1e9)
+
+        action_probs = F.softmax(action_logits, dim=-1)
+        return action_probs, bet_fraction
+
+    def get_value(self, x: torch.Tensor) -> torch.Tensor:
+        """Get state value estimate only.
+
+        Args:
+            x: Input tensor
+
+        Returns:
+            value: (batch, 1) - state value estimate
+        """
+        features = self.feature_extractor(x)
+        return self.value_head(features)
+
+
 def create_network(
     architecture: str = "mlp",
     config: NetworkConfig | None = None,
@@ -316,7 +424,7 @@ def create_network(
     """Factory function to create networks.
 
     Args:
-        architecture: One of "mlp", "deep_mlp", "transformer"
+        architecture: One of "mlp", "deep_mlp", "transformer", "actor_critic"
         config: Network configuration
 
     Returns:
@@ -326,6 +434,7 @@ def create_network(
         "mlp": MLPNetwork,
         "deep_mlp": DeepMLPNetwork,
         "transformer": TransformerNetwork,
+        "actor_critic": ActorCriticMLP,
     }
 
     if architecture not in architectures:
