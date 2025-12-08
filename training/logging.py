@@ -309,4 +309,89 @@ def plot_ppo_training(
     plt.savefig(output_dir / "performance.png", dpi=150, bbox_inches="tight")
     plt.close()
 
-    print(f"Saved 4 plots to {output_dir}/")
+    # 5. RL diagnostics (new)
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    rl_metrics = [
+        ("rl/explained_variance", "Explained Variance", "tab:purple"),
+        ("rl/grad_norm", "Gradient Norm", "tab:red"),
+        ("rl/value_pred_error", "Value Prediction Error", "tab:orange"),
+    ]
+    for ax, (key, title, color) in zip(axes, rl_metrics):
+        if key in metrics:
+            ax.plot(steps, metrics[key], color=color, linewidth=1.5)
+            ax.set_xlabel("Step")
+            ax.set_ylabel(title)
+            ax.set_title(title)
+            ax.grid(True, alpha=0.3)
+            # Add reference line for explained variance
+            if key == "rl/explained_variance":
+                ax.axhline(y=1.0, color="gray", linestyle="--", alpha=0.5, label="Ideal")
+                ax.legend()
+    plt.tight_layout()
+    plt.savefig(output_dir / "rl_diagnostics.png", dpi=150, bbox_inches="tight")
+    plt.close()
+
+    # 6. Poker behavior (new)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    # Win rate
+    if "poker/win_rate" in metrics:
+        ax = axes[0]
+        ax.plot(steps, metrics["poker/win_rate"], color="tab:green", linewidth=1.5)
+        ax.axhline(y=0.5, color="gray", linestyle="--", alpha=0.5, label="Break-even")
+        ax.set_xlabel("Step")
+        ax.set_ylabel("Win Rate")
+        ax.set_title("Win Rate Over Training")
+        ax.set_ylim(0, 1)
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+    # Action distribution (stacked area)
+    action_keys = ["poker/action_fold", "poker/action_check", "poker/action_call",
+                   "poker/action_raise", "poker/action_allin"]
+    action_names = ["Fold", "Check", "Call", "Raise", "All-in"]
+    action_colors = ["tab:red", "tab:gray", "tab:blue", "tab:orange", "tab:purple"]
+    if all(k in metrics for k in action_keys):
+        ax = axes[1]
+        import numpy as np
+        action_data = np.array([metrics[k] for k in action_keys])
+        ax.stackplot(steps, action_data, labels=action_names, colors=action_colors, alpha=0.8)
+        ax.set_xlabel("Step")
+        ax.set_ylabel("Action Proportion")
+        ax.set_title("Action Distribution")
+        ax.set_ylim(0, 1)
+        ax.legend(loc="upper right", fontsize=8)
+        ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_dir / "behavior.png", dpi=150, bbox_inches="tight")
+    plt.close()
+
+    # 7. Stability (new)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    # Reward with trend line
+    if "reward/avg" in metrics:
+        import numpy as np
+        ax = axes[0]
+        rewards = metrics["reward/avg"]
+        ax.plot(steps, rewards, color="tab:green", alpha=0.5, linewidth=1)
+        # Add trend line
+        if len(steps) > 2:
+            z = np.polyfit(steps, rewards, 1)
+            p = np.poly1d(z)
+            ax.plot(steps, p(steps), color="darkgreen", linewidth=2, label=f"Trend (slope={z[0]:.2e})")
+            ax.legend()
+        ax.set_xlabel("Step")
+        ax.set_ylabel("Average Reward")
+        ax.set_title("Reward Trend")
+        ax.grid(True, alpha=0.3)
+    # Entropy decay
+    if "loss/entropy" in metrics:
+        ax = axes[1]
+        ax.plot(steps, metrics["loss/entropy"], color="tab:blue", linewidth=1.5)
+        ax.set_xlabel("Step")
+        ax.set_ylabel("Entropy")
+        ax.set_title("Policy Entropy (Exploration)")
+        ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_dir / "stability.png", dpi=150, bbox_inches="tight")
+    plt.close()
+
+    print(f"Saved 7 plots to {output_dir}/")

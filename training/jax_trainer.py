@@ -112,6 +112,13 @@ class TrainingMetrics:
     steps_per_second: float = 0.0
     games_per_second: float = 0.0
 
+    # Poker behavior metrics
+    wins: int = 0
+    total_pot_won: float = 0.0
+    action_counts: dict = field(default_factory=lambda: {
+        "fold": 0, "check": 0, "call": 0, "raise": 0, "all_in": 0
+    })
+
 
 class JAXTrainer:
     """JAX-accelerated RL trainer for poker."""
@@ -265,6 +272,12 @@ class JAXTrainer:
         games_completed = 0
         total_game_steps = 0
 
+        # Poker behavior tracking
+        wins = 0
+        total_pot_won = 0.0
+        action_counts = {"fold": 0, "check": 0, "call": 0, "raise": 0, "all_in": 0}
+        action_names = ["fold", "check", "call", "raise", "all_in"]
+
         start_time = time.time()
 
         for step_idx in range(num_steps):
@@ -288,6 +301,18 @@ class JAXTrainer:
             games_completed += int(completed)
             total_rewards += float(rewards.sum())
             total_game_steps += int(n_games - completed)
+
+            # Track action distribution
+            actions_np = jnp.asarray(actions)
+            for i, name in enumerate(action_names):
+                action_counts[name] += int((actions_np == i).sum())
+
+            # Track wins (positive reward when game ends)
+            done_mask = dones > 0.5
+            positive_rewards = (rewards > 0) & done_mask
+            wins += int(positive_rewards.sum())
+            # Sum positive rewards for pot won tracking
+            total_pot_won += float(jnp.where(positive_rewards, rewards, 0.0).sum())
 
             # Reset completed games
             if completed > 0:
@@ -330,6 +355,10 @@ class JAXTrainer:
             avg_game_length=total_game_steps / max(games_completed, 1),
             steps_per_second=total_steps / max(elapsed, 0.001),
             games_per_second=games_completed / max(elapsed, 0.001),
+            # Poker behavior
+            wins=wins,
+            total_pot_won=total_pot_won,
+            action_counts=action_counts,
         )
 
         return trajectory, metrics
@@ -398,24 +427,51 @@ class JAXTrainer:
                     )
 
                 if self.logger and (update_idx + 1) % config.log_every == 0:
+                    # Compute derived metrics
+                    total_actions = sum(collect_metrics.action_counts.values())
+                    win_rate = collect_metrics.wins / max(collect_metrics.games_completed, 1)
+                    fold_rate = collect_metrics.action_counts["fold"] / max(total_actions, 1)
+                    raise_count = collect_metrics.action_counts["raise"] + collect_metrics.action_counts["all_in"]
+                    call_count = collect_metrics.action_counts["call"]
+                    aggression = raise_count / max(call_count, 1)
+
                     self.logger.log(global_step, {
+                        # Rewards
                         "reward/avg": collect_metrics.avg_reward,
                         "reward/games_completed": collect_metrics.games_completed,
+                        # Loss
                         "loss/policy": ppo_metrics.policy_loss,
                         "loss/value": ppo_metrics.value_loss,
                         "loss/entropy": ppo_metrics.entropy,
+                        # PPO diagnostics
                         "ppo/approx_kl": ppo_metrics.approx_kl,
                         "ppo/clip_fraction": ppo_metrics.clip_fraction,
+                        # RL diagnostics (new)
+                        "rl/explained_variance": ppo_metrics.explained_variance,
+                        "rl/grad_norm": ppo_metrics.grad_norm,
+                        "rl/value_pred_error": ppo_metrics.value_pred_error,
+                        # Performance
                         "perf/steps_per_second": collect_metrics.steps_per_second,
                         "perf/games_per_second": collect_metrics.games_per_second,
+                        # Poker behavior (new)
+                        "poker/win_rate": win_rate,
+                        "poker/avg_pot_won": collect_metrics.total_pot_won / max(collect_metrics.wins, 1),
+                        "poker/fold_rate": fold_rate,
+                        "poker/aggression": aggression,
+                        "poker/action_fold": collect_metrics.action_counts["fold"] / max(total_actions, 1),
+                        "poker/action_check": collect_metrics.action_counts["check"] / max(total_actions, 1),
+                        "poker/action_call": collect_metrics.action_counts["call"] / max(total_actions, 1),
+                        "poker/action_raise": collect_metrics.action_counts["raise"] / max(total_actions, 1),
+                        "poker/action_allin": collect_metrics.action_counts["all_in"] / max(total_actions, 1),
                     })
 
                 # File logging (persist progress for long runs)
                 if self.file_logger and update_idx % 10 == 0:
+                    win_rate = collect_metrics.wins / max(collect_metrics.games_completed, 1)
                     self.file_logger.info(
                         f"step={global_step:>8} | rew={collect_metrics.avg_reward:>7.3f} | "
-                        f"pol={ppo_metrics.policy_loss:>7.4f} | val={ppo_metrics.value_loss:>7.4f} | "
-                        f"ent={ppo_metrics.entropy:>6.3f} | sps={collect_metrics.steps_per_second:>5.0f}"
+                        f"win={win_rate:>5.1%} | pol={ppo_metrics.policy_loss:>7.4f} | "
+                        f"ev={ppo_metrics.explained_variance:>5.2f} | sps={collect_metrics.steps_per_second:>5.0f}"
                     )
 
                 # Checkpointing

@@ -55,6 +55,10 @@ class PPOMetrics(NamedTuple):
     total_loss: float
     approx_kl: float
     clip_fraction: float
+    # RL diagnostics
+    explained_variance: float
+    grad_norm: float
+    value_pred_error: float
 
 
 def create_optimizer(config: PPOConfig) -> optax.GradientTransformation:
@@ -197,6 +201,17 @@ def ppo_loss(
     approx_kl = ((ratio - 1) - jnp.log(ratio)).mean()
     clip_fraction = (jnp.abs(ratio - 1) > config.epsilon).mean()
 
+    # RL diagnostics
+    # Explained variance: how well value function predicts returns (1.0 = perfect)
+    returns_var = jnp.var(returns)
+    explained_variance = jnp.where(
+        returns_var > 1e-8,
+        1.0 - jnp.var(returns - values) / returns_var,
+        0.0,
+    )
+    # Value prediction error: mean absolute error
+    value_pred_error = jnp.abs(returns - values).mean()
+
     metrics = {
         "policy_loss": policy_loss,
         "value_loss": value_loss,
@@ -204,6 +219,8 @@ def ppo_loss(
         "total_loss": total_loss,
         "approx_kl": approx_kl,
         "clip_fraction": clip_fraction,
+        "explained_variance": explained_variance,
+        "value_pred_error": value_pred_error,
     }
 
     return total_loss, metrics
@@ -235,6 +252,10 @@ def ppo_update_step(
         network, params, obs, actions, old_log_probs,
         advantages, returns, valid_masks, config, rng_key
     )
+
+    # Compute gradient norm before clipping
+    grad_norm = optax.global_norm(grads)
+    metrics["grad_norm"] = grad_norm
 
     # Update parameters
     updates, new_opt_state = optimizer.update(grads, opt_state, params)
@@ -297,6 +318,10 @@ def ppo_update(
         "total_loss": 0.0,
         "approx_kl": 0.0,
         "clip_fraction": 0.0,
+        # RL diagnostics
+        "explained_variance": 0.0,
+        "grad_norm": 0.0,
+        "value_pred_error": 0.0,
     }
     num_updates = 0
 
