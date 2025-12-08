@@ -29,6 +29,13 @@ from poker_jax import (
     ACTION_RAISE,
     ACTION_ALL_IN,
 )
+from evaluation.opponents import (
+    random_opponent,
+    call_station_opponent,
+    tag_opponent,
+    lag_opponent,
+    NEEDS_OBS,
+)
 from poker_jax.network import (
     ActorCriticMLP,
     create_network,
@@ -75,6 +82,125 @@ class JAXTrainingConfig:
     starting_chips: int = 200
     small_blind: int = 1
     big_blind: int = 2
+
+    # Mixed opponent training (v3.1)
+    use_mixed_opponents: bool = False
+    opponent_mix: dict = field(default_factory=lambda: {
+        "self": 0.50,       # 50% self-play
+        "random": 0.15,     # 15% random
+        "call_station": 0.15,  # 15% call station
+        "tag": 0.10,        # 10% tight-aggressive
+        "lag": 0.10,        # 10% loose-aggressive
+    })
+
+
+# Opponent type indices for mixed training
+OPP_SELF = 0
+OPP_RANDOM = 1
+OPP_CALL_STATION = 2
+OPP_TAG = 3
+OPP_LAG = 4
+
+
+def sample_opponent_types(
+    rng_key: Array,
+    n_games: int,
+    opponent_mix: dict,
+) -> Array:
+    """Sample opponent types for each game based on mix probabilities.
+
+    Args:
+        rng_key: PRNG key
+        n_games: Number of games
+        opponent_mix: Dict mapping opponent name to probability
+
+    Returns:
+        [N] array of opponent type indices (0=self, 1=random, etc.)
+    """
+    # Build probability array in order: self, random, call_station, tag, lag
+    probs = jnp.array([
+        opponent_mix.get("self", 0.0),
+        opponent_mix.get("random", 0.0),
+        opponent_mix.get("call_station", 0.0),
+        opponent_mix.get("tag", 0.0),
+        opponent_mix.get("lag", 0.0),
+    ])
+    # Normalize
+    probs = probs / probs.sum()
+
+    # Sample using categorical
+    logits = jnp.log(probs + 1e-10)  # Avoid log(0)
+    logits = jnp.broadcast_to(logits, (n_games, 5))
+    opponent_types = jax.random.categorical(rng_key, logits)
+
+    return opponent_types
+
+
+@partial(jax.jit, static_argnums=(5,))
+def get_mixed_opponent_actions(
+    state: GameState,
+    valid_mask: Array,
+    obs: Array,
+    opponent_types: Array,
+    rng_key: Array,
+    network: "ActorCriticMLP",
+    params: dict,
+) -> Array:
+    """Get actions for mixed opponents based on assigned types.
+
+    Args:
+        state: Current game state [N games]
+        valid_mask: Valid action mask [N, NUM_ACTIONS]
+        obs: Observation for current player [N, obs_dim]
+        opponent_types: Opponent type per game [N]
+        rng_key: PRNG key
+        network: Network for self-play
+        params: Network params for self-play
+
+    Returns:
+        [N] action indices
+    """
+    n_games = state.done.shape[0]
+
+    # Split RNG for each opponent type
+    keys = jrandom.split(rng_key, 5)
+    key_self, key_random, key_call, key_tag, key_lag = keys
+
+    # Compute actions for each opponent type
+    # Self: use network
+    action_logits, _, _ = network.apply({"params": params}, obs, training=False)
+    self_actions, _ = sample_action(key_self, action_logits, valid_mask)
+    self_actions = self_actions + 1  # Convert to game actions (1-indexed)
+
+    # Random opponent
+    random_actions = random_opponent(state, valid_mask, key_random)
+
+    # Call station
+    call_actions = call_station_opponent(state, valid_mask, key_call)
+
+    # TAG (needs obs)
+    tag_actions = tag_opponent(state, valid_mask, key_tag, obs)
+
+    # LAG (needs obs)
+    lag_actions = lag_opponent(state, valid_mask, key_lag, obs)
+
+    # Select based on opponent type
+    # opponent_types: 0=self, 1=random, 2=call_station, 3=tag, 4=lag
+    actions = jnp.where(
+        opponent_types == OPP_SELF, self_actions,
+        jnp.where(
+            opponent_types == OPP_RANDOM, random_actions,
+            jnp.where(
+                opponent_types == OPP_CALL_STATION, call_actions,
+                jnp.where(
+                    opponent_types == OPP_TAG, tag_actions,
+                    lag_actions  # Default to LAG
+                )
+            )
+        )
+    )
+
+    return actions
 
 
 @dataclass
@@ -181,6 +307,12 @@ class JAXTrainer:
         self.console.print(f"Parallel games: {self.training_config.num_parallel_games:,}")
         self.console.print(f"Steps per update: {self.training_config.steps_per_update:,}")
 
+        # Mixed opponents info
+        if self.training_config.use_mixed_opponents:
+            self.console.print(f"[bold green]Mixed Opponent Training (v3.1)[/bold green]")
+            mix = self.training_config.opponent_mix
+            self.console.print(f"  Opponent mix: {', '.join(f'{k}={v:.0%}' for k,v in mix.items())}")
+
     @staticmethod
     @partial(jax.jit, static_argnums=(0,))
     def _collect_step(
@@ -240,6 +372,84 @@ class JAXTrainer:
 
         return new_state, obs, actions, log_probs, values, player_rewards, dones, valid_mask
 
+    @staticmethod
+    @partial(jax.jit, static_argnums=(0,))
+    def _collect_step_mixed(
+        network: ActorCriticMLP,
+        params: dict,
+        state: GameState,
+        opponent_types: Array,
+        rng_key: Array,
+    ) -> tuple[GameState, Array, Array, Array, Array, Array, Array, Array, Array]:
+        """Collect one step with mixed opponents (JIT-compiled).
+
+        Model is always player 0. Opponents are player 1.
+
+        Returns:
+            Tuple of (new_state, obs, actions, log_probs, values, rewards, dones, valid_mask, model_turn_mask)
+        """
+        n_games = state.done.shape[0]
+
+        # Encode state for current player
+        obs = encode_state_for_current_player(state)
+        valid_mask = get_valid_actions_from_obs(obs)
+
+        # Whose turn is it?
+        is_model_turn = state.current_player == 0
+
+        # Model forward pass (always compute for value estimates)
+        action_logits, _, values = network.apply(
+            {"params": params}, obs, training=False
+        )
+        values = values.squeeze(-1)
+
+        # Sample model actions
+        rng_key, model_key, opp_key = jrandom.split(rng_key, 3)
+        model_actions, log_probs = sample_action(model_key, action_logits, valid_mask)
+
+        # Get opponent actions based on type
+        # Note: valid_mask from encoding is the full 8-action mask
+        # Opponents expect this format (already in correct format)
+        opponent_actions = get_mixed_opponent_actions(
+            state, valid_mask, obs, opponent_types,
+            opp_key, network, params
+        )
+
+        # Select action based on whose turn
+        # Model actions are 0-indexed (need +1 for game), opponent actions are already 1-indexed
+        game_actions = jnp.where(
+            is_model_turn,
+            model_actions + 1,  # Model uses 0-indexed, convert to 1-indexed
+            opponent_actions    # Opponents already return 1-indexed
+        )
+
+        # For training, we use the model's actions (0-indexed for trajectory)
+        # When it's opponent's turn, we still store model's hypothetical action
+        # This is a simplification - we'll mask these in PPO loss
+        trajectory_actions = model_actions
+
+        # Compute raise amounts
+        opp_idx = 1 - state.current_player
+        game_idx = jnp.arange(n_games)
+        opp_bet = state.bets[game_idx, opp_idx]
+        raise_amounts = opp_bet + state.last_raise_amount
+
+        # Step environment
+        new_state = step(state, game_actions, raise_amounts)
+
+        # Get rewards
+        rewards = get_rewards(new_state)
+        # Model's reward (always player 0)
+        model_rewards = rewards[:, 0]
+
+        # Done flags
+        dones = new_state.done.astype(jnp.float32)
+
+        # Create mask for model's turns (used to filter training data)
+        model_turn_mask = is_model_turn.astype(jnp.float32)
+
+        return new_state, obs, trajectory_actions, log_probs, values, model_rewards, dones, valid_mask, model_turn_mask
+
     def collect_rollout(
         self,
         num_steps: int,
@@ -294,12 +504,24 @@ class JAXTrainer:
 
         start_time = time.time()
 
+        # Mixed opponent mode setup
+        use_mixed = config.use_mixed_opponents
+        if use_mixed:
+            self.rng_key, opp_key = jrandom.split(self.rng_key)
+            opponent_types = sample_opponent_types(opp_key, n_games, config.opponent_mix)
+
         for step_idx in range(num_steps):
             # Collect step
             self.rng_key, step_key = jrandom.split(self.rng_key)
 
-            new_state, obs, actions, log_probs, values, rewards, dones, valid_mask = \
-                self._collect_step(self.network, self.params, state, step_key)
+            if use_mixed:
+                # Mixed opponent mode: model is player 0, opponents are player 1
+                new_state, obs, actions, log_probs, values, rewards, dones, valid_mask, model_mask = \
+                    self._collect_step_mixed(self.network, self.params, state, opponent_types, step_key)
+            else:
+                # Self-play mode: both players use network
+                new_state, obs, actions, log_probs, values, rewards, dones, valid_mask = \
+                    self._collect_step(self.network, self.params, state, step_key)
 
             # Store
             all_obs.append(obs)
@@ -316,12 +538,21 @@ class JAXTrainer:
             total_rewards += float(rewards.sum())
             total_game_steps += int(n_games - completed)
 
-            # Track action distribution (v3: actions are 1-8)
-            actions_np = jnp.asarray(actions)
-            for idx, name in action_idx_to_name.items():
-                action_counts[name] += int((actions_np == idx).sum())
+            # Track action distribution (only for model's actions in mixed mode)
+            if use_mixed:
+                # In mixed mode, actions are 0-indexed from model perspective
+                # Only count when it was model's turn
+                model_turn = state.current_player == 0
+                for idx, name in action_idx_to_name.items():
+                    # Convert from 0-indexed to 1-indexed for comparison
+                    action_counts[name] += int(((actions == (idx - 1)) & model_turn).sum())
+            else:
+                # Self-play: actions are 0-indexed
+                actions_np = jnp.asarray(actions)
+                for idx, name in action_idx_to_name.items():
+                    action_counts[name] += int((actions_np == (idx - 1)).sum())
 
-            # Track wins and losses (only when game ends on this player's action)
+            # Track wins and losses
             done_mask = dones > 0.5
             won_games = (rewards > 0) & done_mask
             lost_games = (rewards < 0) & done_mask
@@ -346,6 +577,12 @@ class JAXTrainer:
                     return jnp.where(done_mask, fresh, old)
 
                 state = jax.tree_util.tree_map(select_state, fresh_state, new_state)
+
+                # Resample opponent types for reset games (mixed mode)
+                if use_mixed:
+                    self.rng_key, opp_key = jrandom.split(self.rng_key)
+                    new_opp_types = sample_opponent_types(opp_key, n_games, config.opponent_mix)
+                    opponent_types = jnp.where(new_state.done, new_opp_types, opponent_types)
             else:
                 state = new_state
 

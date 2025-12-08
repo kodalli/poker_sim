@@ -1,0 +1,20 @@
+{
+  "version": "v2-test",
+  "architecture": "actor_critic",
+  "generations": 4,
+  "population_size": 1,
+  "best_fitness": 0.0,
+  "created": "2025-12-08T01:06:14.205662",
+  "description": "RL training with PPO - 200 games",
+  "config": {
+    "hidden_dims": [
+      256,
+      128,
+      64
+    ],
+    "learning_rate": 0.0003,
+    "games_trained": 200,
+    "opponent_type": "mixed",
+    "training_method": "ppo"
+  }
+}

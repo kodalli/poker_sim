@@ -1,0 +1,16 @@
+{
+  "version": "v2.2-jit-test",
+  "architecture": "actor_critic_jax",
+  "generations": 32552,
+  "population_size": 1536,
+  "best_fitness": 0.0,
+  "created": "2025-12-08T12:16:26.211856",
+  "description": "JAX training - 100,000,000 steps",
+  "config": {
+    "learning_rate": 0.0003,
+    "total_steps": 100000000,
+    "parallel_games": 1536,
+    "training_method": "ppo_jax",
+    "steps_per_second": 169724.08621926533
+  }
+}
