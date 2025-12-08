@@ -333,12 +333,16 @@ def train_rl(
 def train_rl_jax(
     model: str = typer.Option("v2-jax", "--model", "-m", help="Model version"),
     steps: int = typer.Option(1_000_000, "--steps", "-s", help="Total training steps"),
-    parallel_games: int = typer.Option(1024, "--parallel", "-p", help="Parallel games on GPU"),
+    parallel_games: int = typer.Option(1536, "--parallel", "-p", help="Parallel games on GPU (1536 optimal for RTX 4090)"),
     lr: float = typer.Option(3e-4, "--lr", help="Learning rate"),
     tensorboard: Optional[str] = typer.Option("logs/jax", "--tensorboard", "-t", help="TensorBoard log directory"),
     description: str = typer.Option("", "--desc", "-d", help="Model description"),
     seed: Optional[int] = typer.Option(42, "--seed", help="Random seed"),
     background: bool = typer.Option(False, "--background", "-b", help="Run in background"),
+    # Advanced PPO options
+    minibatches: int = typer.Option(8, "--minibatches", help="PPO minibatches (8 optimal for large batches)"),
+    steps_per_update: Optional[int] = typer.Option(None, "--steps-per-update", help="Steps between PPO updates (auto-computed if not set)"),
+    ppo_epochs: int = typer.Option(4, "--ppo-epochs", help="PPO epochs per update"),
 ) -> None:
     """Train poker AI using JAX-accelerated PPO (GPU-optimized)."""
     try:
@@ -389,21 +393,25 @@ def train_rl_jax(
         gamma=0.99,
         lambda_=0.95,
         epsilon=0.2,
-        ppo_epochs=4,
-        num_minibatches=4,
+        ppo_epochs=ppo_epochs,
+        num_minibatches=minibatches,
         entropy_coef=0.01,
         value_coef=0.5,
     )
 
-    # Compute steps_per_update: aim for 64 steps per game, but ensure at least 4 updates
-    target_steps_per_update = parallel_games * 64
-    max_steps_per_update = max(steps // 4, parallel_games)  # Ensure at least 4 updates
-    steps_per_update = min(target_steps_per_update, max_steps_per_update)
+    # Compute steps_per_update if not specified
+    if steps_per_update is None:
+        # Default: 2x parallel games for good batch diversity
+        target_steps = parallel_games * 2
+        max_steps = max(steps // 4, parallel_games)  # Ensure at least 4 updates
+        computed_steps_per_update = min(target_steps, max_steps)
+    else:
+        computed_steps_per_update = steps_per_update
 
     training_config = JAXTrainingConfig(
         num_parallel_games=parallel_games,
         total_steps=steps,
-        steps_per_update=steps_per_update,
+        steps_per_update=computed_steps_per_update,
         checkpoint_every=50_000,
         checkpoint_dir=checkpoint_dir,
         tensorboard_dir=tensorboard,

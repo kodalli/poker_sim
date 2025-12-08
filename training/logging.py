@@ -1,6 +1,8 @@
 """Metrics logging for training (TensorBoard + CSV)."""
 
 import csv
+import queue
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +21,8 @@ class MetricsLogger:
         log_dir: Path,
         use_tensorboard: bool = True,
         use_csv: bool = True,
+        async_logging: bool = True,
+        flush_every: int = 50,
     ) -> None:
         """Initialize logger.
 
@@ -26,12 +30,17 @@ class MetricsLogger:
             log_dir: Directory for log files
             use_tensorboard: Enable TensorBoard logging
             use_csv: Enable CSV logging
+            async_logging: Use background thread for non-blocking logging
+            flush_every: Flush CSV every N writes (reduces disk I/O)
         """
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
         self.use_tensorboard = use_tensorboard
         self.use_csv = use_csv
+        self.async_logging = async_logging
+        self.flush_every = flush_every
+        self._write_count = 0
 
         # TensorBoard writer
         self.writer = None
@@ -50,6 +59,15 @@ class MetricsLogger:
         if use_csv:
             self.csv_path = self.log_dir / "metrics.csv"
 
+        # Async logging setup
+        self._queue: queue.Queue | None = None
+        self._worker: threading.Thread | None = None
+        self._stop_event = threading.Event()
+        if async_logging:
+            self._queue = queue.Queue()
+            self._worker = threading.Thread(target=self._async_worker, daemon=True)
+            self._worker.start()
+
     def log(self, step: int, metrics: dict[str, float]) -> None:
         """Log metrics at a given step.
 
@@ -57,6 +75,15 @@ class MetricsLogger:
             step: Training step/iteration
             metrics: Dictionary of metric name -> value
         """
+        if self.async_logging and self._queue is not None:
+            # Non-blocking: put in queue for background thread
+            self._queue.put((step, metrics.copy()))
+        else:
+            # Synchronous logging
+            self._do_log(step, metrics)
+
+    def _do_log(self, step: int, metrics: dict[str, float]) -> None:
+        """Actually perform the logging (called from worker thread if async)."""
         # TensorBoard
         if self.use_tensorboard and self.writer is not None:
             for name, value in metrics.items():
@@ -65,6 +92,19 @@ class MetricsLogger:
         # CSV
         if self.use_csv:
             self._log_csv(step, metrics)
+
+    def _async_worker(self) -> None:
+        """Background worker thread for async logging."""
+        while not self._stop_event.is_set():
+            try:
+                # Wait for item with timeout to allow checking stop event
+                step, metrics = self._queue.get(timeout=0.1)
+                self._do_log(step, metrics)
+                self._queue.task_done()
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"Async logging error: {e}")
 
     def _log_csv(self, step: int, metrics: dict[str, float]) -> None:
         """Write metrics to CSV file."""
@@ -87,7 +127,12 @@ class MetricsLogger:
         # Write row
         row = {"step": step, **metrics}
         self.csv_writer.writerow(row)
-        self.csv_file.flush()
+
+        # Batch flush: only flush every N writes to reduce disk I/O
+        self._write_count += 1
+        if self._write_count >= self.flush_every:
+            self.csv_file.flush()
+            self._write_count = 0
 
     def log_histogram(self, step: int, name: str, values: Any) -> None:
         """Log histogram data (TensorBoard only).
@@ -120,9 +165,19 @@ class MetricsLogger:
 
     def close(self) -> None:
         """Close all writers."""
+        # Stop async worker if running
+        if self.async_logging and self._queue is not None:
+            # Wait for queue to drain
+            self._queue.join()
+            # Signal worker to stop
+            self._stop_event.set()
+            if self._worker is not None:
+                self._worker.join(timeout=2.0)
+
         if self.writer is not None:
             self.writer.close()
         if self.csv_file is not None:
+            self.csv_file.flush()  # Final flush
             self.csv_file.close()
 
     def __enter__(self) -> "MetricsLogger":

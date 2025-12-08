@@ -24,7 +24,7 @@ class PPOConfig:
     lambda_: float = 0.95  # GAE parameter
     epsilon: float = 0.2  # Clipping parameter
     ppo_epochs: int = 4  # Update epochs per batch
-    num_minibatches: int = 4  # Number of minibatches
+    num_minibatches: int = 8  # Number of minibatches (optimized for large batches)
 
     # Loss weights
     value_coef: float = 0.5
@@ -264,6 +264,72 @@ def ppo_update_step(
     return new_params, new_opt_state, metrics
 
 
+def _create_ppo_epoch_fn(network, optimizer, config):
+    """Create JIT-compiled epoch function for PPO updates.
+
+    This is separated to allow JIT compilation with static arguments.
+    """
+    num_minibatches = config.num_minibatches
+
+    @jax.jit
+    def single_epoch(carry, _):
+        """Process one epoch of minibatch updates."""
+        params, opt_state, metrics_sum, rng_key, data = carry
+        obs_flat, actions_flat, log_probs_flat, advantages_flat, returns_flat, valid_masks_flat = data
+
+        batch_size = obs_flat.shape[0]
+        minibatch_size = batch_size // num_minibatches
+
+        # Shuffle indices for this epoch
+        rng_key, shuffle_key = jax.random.split(rng_key)
+        indices = jax.random.permutation(shuffle_key, batch_size)
+
+        def single_minibatch(mb_carry, mb_idx):
+            """Process one minibatch update."""
+            params, opt_state, metrics_sum, rng_key = mb_carry
+
+            # Get minibatch indices
+            start = mb_idx * minibatch_size
+            mb_indices = jax.lax.dynamic_slice(indices, [start], [minibatch_size])
+
+            # Get minibatch data
+            mb_obs = obs_flat[mb_indices]
+            mb_actions = actions_flat[mb_indices]
+            mb_log_probs = log_probs_flat[mb_indices]
+            mb_advantages = advantages_flat[mb_indices]
+            mb_returns = returns_flat[mb_indices]
+            mb_valid_masks = valid_masks_flat[mb_indices]
+
+            # Update
+            rng_key, update_key = jax.random.split(rng_key)
+            params, opt_state, metrics = ppo_update_step(
+                network, params, opt_state, optimizer,
+                mb_obs, mb_actions, mb_log_probs,
+                mb_advantages, mb_returns, mb_valid_masks,
+                config, update_key
+            )
+
+            # Accumulate metrics (keep as JAX arrays, no float() conversion!)
+            new_metrics_sum = {k: metrics_sum[k] + metrics[k] for k in metrics_sum.keys()}
+
+            return (params, opt_state, new_metrics_sum, rng_key), None
+
+        # Process all minibatches in this epoch
+        (params, opt_state, metrics_sum, rng_key), _ = jax.lax.scan(
+            single_minibatch,
+            (params, opt_state, metrics_sum, rng_key),
+            jnp.arange(num_minibatches)
+        )
+
+        return (params, opt_state, metrics_sum, rng_key, data), None
+
+    return single_epoch
+
+
+# Cache for compiled epoch functions
+_epoch_fn_cache = {}
+
+
 def ppo_update(
     network: nn.Module,
     params: dict,
@@ -273,7 +339,10 @@ def ppo_update(
     config: PPOConfig,
     rng_key: Array,
 ) -> tuple[dict, optax.OptState, PPOMetrics]:
-    """Full PPO update on trajectory data.
+    """Full PPO update on trajectory data (JIT-optimized).
+
+    This version uses jax.lax.scan instead of Python for-loops,
+    keeping all computation on GPU without device->host transfers.
 
     Args:
         network: Flax network
@@ -310,59 +379,36 @@ def ppo_update(
     returns_flat = returns.reshape(-1)
     valid_masks_flat = trajectory.valid_masks.reshape(-1, trajectory.valid_masks.shape[-1])
 
-    # Track metrics
-    total_metrics = {
-        "policy_loss": 0.0,
-        "value_loss": 0.0,
-        "entropy": 0.0,
-        "total_loss": 0.0,
-        "approx_kl": 0.0,
-        "clip_fraction": 0.0,
-        # RL diagnostics
-        "explained_variance": 0.0,
-        "grad_norm": 0.0,
-        "value_pred_error": 0.0,
+    data = (obs_flat, actions_flat, log_probs_flat, advantages_flat, returns_flat, valid_masks_flat)
+
+    # Initialize metrics accumulator (JAX arrays)
+    init_metrics = {
+        "policy_loss": jnp.array(0.0),
+        "value_loss": jnp.array(0.0),
+        "entropy": jnp.array(0.0),
+        "total_loss": jnp.array(0.0),
+        "approx_kl": jnp.array(0.0),
+        "clip_fraction": jnp.array(0.0),
+        "explained_variance": jnp.array(0.0),
+        "grad_norm": jnp.array(0.0),
+        "value_pred_error": jnp.array(0.0),
     }
-    num_updates = 0
 
-    batch_size = T * N
-    minibatch_size = batch_size // config.num_minibatches
+    # Get or create cached epoch function
+    cache_key = (id(network), id(optimizer), config.num_minibatches)
+    if cache_key not in _epoch_fn_cache:
+        _epoch_fn_cache[cache_key] = _create_ppo_epoch_fn(network, optimizer, config)
+    epoch_fn = _epoch_fn_cache[cache_key]
 
-    # Multiple epochs
-    for epoch in range(config.ppo_epochs):
-        # Shuffle indices
-        rng_key, shuffle_key = jax.random.split(rng_key)
-        indices = jax.random.permutation(shuffle_key, batch_size)
+    # Run all epochs using scan (fully on GPU)
+    (params, opt_state, metrics_sum, _, _), _ = jax.lax.scan(
+        epoch_fn,
+        (params, opt_state, init_metrics, rng_key, data),
+        jnp.arange(config.ppo_epochs)
+    )
 
-        # Process minibatches
-        for start in range(0, batch_size, minibatch_size):
-            end = start + minibatch_size
-            mb_indices = indices[start:end]
+    # Average metrics and convert to Python floats (only once at the end!)
+    num_updates = config.ppo_epochs * config.num_minibatches
+    final_metrics = {k: float(v / num_updates) for k, v in metrics_sum.items()}
 
-            # Get minibatch data
-            mb_obs = obs_flat[mb_indices]
-            mb_actions = actions_flat[mb_indices]
-            mb_log_probs = log_probs_flat[mb_indices]
-            mb_advantages = advantages_flat[mb_indices]
-            mb_returns = returns_flat[mb_indices]
-            mb_valid_masks = valid_masks_flat[mb_indices]
-
-            # Update
-            rng_key, update_key = jax.random.split(rng_key)
-            params, opt_state, metrics = ppo_update_step(
-                network, params, opt_state, optimizer,
-                mb_obs, mb_actions, mb_log_probs,
-                mb_advantages, mb_returns, mb_valid_masks,
-                config, update_key
-            )
-
-            # Accumulate metrics
-            for k, v in metrics.items():
-                total_metrics[k] += float(v)
-            num_updates += 1
-
-    # Average metrics
-    for k in total_metrics:
-        total_metrics[k] /= max(num_updates, 1)
-
-    return params, opt_state, PPOMetrics(**total_metrics)
+    return params, opt_state, PPOMetrics(**final_metrics)

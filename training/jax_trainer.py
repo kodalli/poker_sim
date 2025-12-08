@@ -51,24 +51,24 @@ from training.logging import MetricsLogger
 class JAXTrainingConfig:
     """Configuration for JAX-accelerated training."""
 
-    # Parallelism
-    num_parallel_games: int = 1024  # Games to run in parallel
+    # Parallelism (optimized for RTX 4090 24GB VRAM)
+    num_parallel_games: int = 1536  # Games to run in parallel
     steps_per_game: int = 200  # Max steps per game (auto-resets)
 
     # Training loop
     total_steps: int = 1_000_000  # Total environment steps
-    steps_per_update: int = 2048  # Steps between PPO updates
+    steps_per_update: int = 3072  # Steps between PPO updates
 
     # Evaluation
     eval_every: int = 10_000  # Evaluate every N steps
     eval_games: int = 100  # Games for evaluation
 
-    # Checkpointing
-    checkpoint_every: int = 50_000
+    # Checkpointing (save ~20 checkpoints for long runs)
+    checkpoint_every: int = 500_000_000  # Every 500M steps
     checkpoint_dir: str = "models/jax/checkpoints"
 
     # Logging (log_every is in updates, not steps)
-    log_every: int = 1  # Log every N updates
+    log_every: int = 100  # Log every N updates (reduces CSV/TB storage)
     tensorboard_dir: str | None = "logs/jax"
 
     # Game settings
@@ -394,7 +394,8 @@ class JAXTrainer:
 
         iterator = range(total_updates)
         if show_progress:
-            iterator = tqdm(iterator, desc="Training", unit="updates")
+            # mininterval=5.0 reduces terminal I/O overhead (update display max every 5 seconds)
+            iterator = tqdm(iterator, desc="Training", unit="updates", mininterval=5.0)
 
         global_step = 0
         total_games = 0
@@ -421,8 +422,8 @@ class JAXTrainer:
                     update_key,
                 )
 
-                # Logging
-                if show_progress:
+                # Logging - only update progress bar every 100 updates to reduce terminal I/O
+                if show_progress and (update_idx + 1) % 100 == 0:
                     iterator.set_postfix(
                         rew=f"{collect_metrics.avg_reward:.2f}",
                         pol=f"{ppo_metrics.policy_loss:.4f}",
@@ -472,8 +473,8 @@ class JAXTrainer:
                         "poker/action_allin": collect_metrics.action_counts["all_in"] / max(total_actions, 1),
                     })
 
-                # File logging (persist progress for long runs)
-                if self.file_logger and update_idx % 10 == 0:
+                # File logging (persist progress for long runs) - reduced frequency
+                if self.file_logger and update_idx % 1000 == 0:
                     decided_games = collect_metrics.wins + collect_metrics.losses
                     win_rate = collect_metrics.wins / max(decided_games, 1)
                     total_actions = sum(collect_metrics.action_counts.values())
