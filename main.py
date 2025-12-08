@@ -208,7 +208,7 @@ def evaluate(
 
 
 class DebugNeuralAgent(BaseAgent):
-    """Wrapper that displays AI decision details after each action."""
+    """Wrapper that stores AI decision details for display."""
 
     def __init__(
         self,
@@ -221,6 +221,7 @@ class DebugNeuralAgent(BaseAgent):
         self._last_action: PlayerAction | None = None
         self._last_probs: dict[ActionType, float] | None = None
         self._last_bet_fraction: float | None = None
+        self.last_decision_panel = None  # Store panel for display by HumanAgent
 
     def decide(self, table_state: TableState) -> PlayerAction:
         # Get action from underlying agent
@@ -241,12 +242,15 @@ class DebugNeuralAgent(BaseAgent):
         self._last_probs = probs
         self._last_bet_fraction = bet_fraction
 
-        # Display decision
+        # Create and store the panel (don't print - let HumanAgent display it)
         from ui.display import render_ai_decision
-        panel = render_ai_decision(action, probs, bet_fraction)
-        self._console.print(panel)
+        self.last_decision_panel = render_ai_decision(action, probs, bet_fraction)
 
         return action
+
+    def clear_decision(self) -> None:
+        """Clear the stored decision panel."""
+        self.last_decision_panel = None
 
     def notify_hand_result(self, chip_delta: int, won: bool) -> None:
         self._agent.notify_hand_result(chip_delta, won)
@@ -260,14 +264,14 @@ def _run_human_game(
     max_hands: int,
     cpu: bool,
 ) -> None:
-    """Run interactive human vs AI game."""
+    """Run interactive human vs AI game with TUI-style display."""
     from poker.game import TexasHoldemGame
     from agents.human_agent import HumanAgent
-    from ui.display import clear_screen, print_divider, render_hand_result
+    from ui.display import print_divider, render_hand_result
 
     device = get_device(prefer_cuda=not cpu)
 
-    # Load AI from checkpoint
+    # Load AI from checkpoint (before entering alternate screen)
     if not Path(checkpoint_path).exists():
         console.print(f"[red]Checkpoint not found: {checkpoint_path}[/red]")
         console.print("[yellow]Run 'uv run python main.py train' first to train an AI.[/yellow]")
@@ -279,11 +283,14 @@ def _run_human_game(
     best = pop.get_best_individuals(1)[0]
 
     # Create agents
-    ai_agent = pop.get_agent(best, temperature=0.3)  # Lower temp for more deterministic
+    ai_agent = pop.get_agent(best, temperature=0.3)
     ai_agent.name = "AI"
     debug_ai = DebugNeuralAgent(ai_agent, console)
 
     human_agent = HumanAgent(name="You", console=console)
+    human_agent.use_alternate_screen = True
+    # Connect human agent to AI's decision panel
+    human_agent.set_ai_decision_getter(lambda: debug_ai.last_decision_panel)
 
     # Game settings
     small_blind = 1
@@ -301,75 +308,86 @@ def _run_human_game(
 
     dealer_position = 0
     hands_played = 0
+    game_interrupted = False
 
-    console.print("\n[bold green]Game started![/bold green]")
+    console.print("\n[bold green]Starting game...[/bold green]")
     console.print(f"Starting chips: {starting_chips} | Blinds: {small_blind}/{big_blind}")
-    console.print("[dim]Type 'q' to quit at any time.[/dim]\n")
-    print_divider(console, "=")
+    console.print("[dim]Type 'q' to quit at any time. Press Enter to continue...[/dim]")
+    input()
 
-    try:
-        while hands_played < max_hands:
-            # Check if game over
-            active_players = [p for p in players if p.chips > 0]
-            if len(active_players) <= 1:
-                break
-
-            hands_played += 1
-            console.print(f"\n[bold]Hand #{hands_played}[/bold]")
-            print_divider(console)
-
-            # Play a hand
-            game = TexasHoldemGame(
-                players=active_players,
-                dealer_position=dealer_position % len(active_players),
-                small_blind=small_blind,
-                big_blind=big_blind,
-            )
-
-            result = game.play(agents_dict)
-
-            # Show hand result
-            human_delta = result.chip_changes.get(0, 0)
-            human_won = 0 in result.winners
-
-            # Get winning hand description if showdown
-            winning_hand = None
-            if result.showdown_hands and result.winning_hand:
-                winning_hand = str(result.winning_hand.rank.name.replace("_", " ").title())
-
-            result_panel = render_hand_result(
-                won=human_won,
-                chip_delta=human_delta,
-                my_chips=players[0].chips,
-                opponent_chips=players[1].chips,
-                showdown=not result.all_folded,
-                winning_hand=winning_hand,
-            )
-            console.print(result_panel)
-
-            # Notify agents
-            for i, agent in enumerate(agents_list):
-                chip_delta = result.chip_changes.get(i, 0)
-                won = i in result.winners
-                agent.notify_hand_result(chip_delta, won)
-
-            # Rotate dealer
-            dealer_position = (dealer_position + 1) % 2
-
-            # Pause between hands
-            if hands_played < max_hands and len([p for p in players if p.chips > 0]) > 1:
-                console.print("\n[dim]Press Enter for next hand (or 'q' to quit)...[/dim]")
-                try:
-                    inp = input()
-                    if inp.lower() in ('q', 'quit', 'exit'):
-                        break
-                except EOFError:
+    # Enter alternate screen buffer for TUI-style display
+    with console.screen():
+        try:
+            while hands_played < max_hands:
+                # Check if game over
+                active_players = [p for p in players if p.chips > 0]
+                if len(active_players) <= 1:
                     break
 
-    except KeyboardInterrupt:
-        console.print("\n\n[yellow]Game interrupted.[/yellow]")
+                hands_played += 1
 
-    # Final results
+                # Update human agent context
+                human_agent.hand_number = hands_played
+                debug_ai.clear_decision()
+
+                # Play a hand
+                game = TexasHoldemGame(
+                    players=active_players,
+                    dealer_position=dealer_position % len(active_players),
+                    small_blind=small_blind,
+                    big_blind=big_blind,
+                )
+
+                result = game.play(agents_dict)
+
+                # Show hand result (clear and display result screen)
+                console.clear()
+                human_delta = result.chip_changes.get(0, 0)
+                human_won = 0 in result.winners
+
+                # Get winning hand description if showdown
+                winning_hand = None
+                if result.showdown_hands and result.winning_hand:
+                    winning_hand = str(result.winning_hand.rank.name.replace("_", " ").title())
+
+                # Display result screen
+                console.print(f"\n[bold blue]POKER - Hand #{hands_played} Result[/bold blue]\n")
+                result_panel = render_hand_result(
+                    won=human_won,
+                    chip_delta=human_delta,
+                    my_chips=players[0].chips,
+                    opponent_chips=players[1].chips,
+                    showdown=not result.all_folded,
+                    winning_hand=winning_hand,
+                )
+                console.print(result_panel)
+
+                # Notify agents
+                for i, agent in enumerate(agents_list):
+                    chip_delta = result.chip_changes.get(i, 0)
+                    won = i in result.winners
+                    agent.notify_hand_result(chip_delta, won)
+
+                # Rotate dealer
+                dealer_position = (dealer_position + 1) % 2
+
+                # Pause between hands
+                if hands_played < max_hands and len([p for p in players if p.chips > 0]) > 1:
+                    console.print("\n[dim]Press Enter for next hand (or 'q' to quit)...[/dim]")
+                    try:
+                        inp = input()
+                        if inp.lower() in ('q', 'quit', 'exit'):
+                            break
+                    except EOFError:
+                        break
+
+        except KeyboardInterrupt:
+            game_interrupted = True
+
+    # Back to normal screen - show final results
+    if game_interrupted:
+        console.print("\n[yellow]Game interrupted.[/yellow]")
+
     console.print("\n")
     print_divider(console, "=")
     console.print("[bold]Final Results[/bold]")

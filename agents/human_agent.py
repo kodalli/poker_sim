@@ -1,6 +1,7 @@
 """Human player agent for interactive terminal poker."""
 
 from rich.console import Console
+from rich.panel import Panel
 
 from agents.base import BaseAgent
 from poker.player import ActionType, PlayerAction
@@ -25,15 +26,31 @@ class HumanAgent(BaseAgent):
     ) -> None:
         super().__init__(name)
         self.console = console or Console()
+        # Context set by game loop for display
+        self.hand_number: int = 1
+        self.last_ai_decision: Panel | None = None
+        self.use_alternate_screen: bool = True
+        # Callback to fetch latest AI decision
+        self._get_ai_decision: callable = lambda: None
+
+    def set_ai_decision_getter(self, getter: callable) -> None:
+        """Set callback to fetch latest AI decision panel."""
+        self._get_ai_decision = getter
 
     def decide(self, table_state: TableState) -> PlayerAction:
         """Display game state and prompt human for action."""
+        # Fetch latest AI decision before displaying
+        self.last_ai_decision = self._get_ai_decision()
+        if self.use_alternate_screen:
+            self.console.clear()
         self._display_game_state(table_state)
         return self._get_player_action(table_state)
 
     def _display_game_state(self, table_state: TableState) -> None:
         """Render the current game state."""
-        self.console.print()
+        # Title with hand number
+        title = f"[bold blue]POKER - Hand #{self.hand_number}[/bold blue]"
+        self.console.print(title, justify="center")
 
         # Round header
         self.console.print(render_game_header(table_state.round))
@@ -64,6 +81,12 @@ class HumanAgent(BaseAgent):
         self.console.print(info_table)
 
         print_divider(self.console)
+
+        # Show last AI decision if available
+        if self.last_ai_decision is not None:
+            self.console.print(self.last_ai_decision)
+            print_divider(self.console)
+
         self.console.print()
 
     def _get_player_action(self, table_state: TableState) -> PlayerAction:
