@@ -114,6 +114,7 @@ class TrainingMetrics:
 
     # Poker behavior metrics
     wins: int = 0
+    losses: int = 0  # Track losses for accurate win rate
     total_pot_won: float = 0.0
     action_counts: dict = field(default_factory=lambda: {
         "fold": 0, "check": 0, "call": 0, "raise": 0, "all_in": 0
@@ -274,6 +275,7 @@ class JAXTrainer:
 
         # Poker behavior tracking
         wins = 0
+        losses = 0
         total_pot_won = 0.0
         action_counts = {"fold": 0, "check": 0, "call": 0, "raise": 0, "all_in": 0}
         action_names = ["fold", "check", "call", "raise", "all_in"]
@@ -307,12 +309,14 @@ class JAXTrainer:
             for i, name in enumerate(action_names):
                 action_counts[name] += int((actions_np == i).sum())
 
-            # Track wins (positive reward when game ends)
+            # Track wins and losses (only when game ends on this player's action)
             done_mask = dones > 0.5
-            positive_rewards = (rewards > 0) & done_mask
-            wins += int(positive_rewards.sum())
+            won_games = (rewards > 0) & done_mask
+            lost_games = (rewards < 0) & done_mask
+            wins += int(won_games.sum())
+            losses += int(lost_games.sum())
             # Sum positive rewards for pot won tracking
-            total_pot_won += float(jnp.where(positive_rewards, rewards, 0.0).sum())
+            total_pot_won += float(jnp.where(won_games, rewards, 0.0).sum())
 
             # Reset completed games
             if completed > 0:
@@ -357,6 +361,7 @@ class JAXTrainer:
             games_per_second=games_completed / max(elapsed, 0.001),
             # Poker behavior
             wins=wins,
+            losses=losses,
             total_pot_won=total_pot_won,
             action_counts=action_counts,
         )
@@ -429,7 +434,9 @@ class JAXTrainer:
                 if self.logger and (update_idx + 1) % config.log_every == 0:
                     # Compute derived metrics
                     total_actions = sum(collect_metrics.action_counts.values())
-                    win_rate = collect_metrics.wins / max(collect_metrics.games_completed, 1)
+                    # Win rate: when I ended the game, how often did I win?
+                    decided_games = collect_metrics.wins + collect_metrics.losses
+                    win_rate = collect_metrics.wins / max(decided_games, 1)
                     fold_rate = collect_metrics.action_counts["fold"] / max(total_actions, 1)
                     raise_count = collect_metrics.action_counts["raise"] + collect_metrics.action_counts["all_in"]
                     call_count = collect_metrics.action_counts["call"]
@@ -467,11 +474,20 @@ class JAXTrainer:
 
                 # File logging (persist progress for long runs)
                 if self.file_logger and update_idx % 10 == 0:
-                    win_rate = collect_metrics.wins / max(collect_metrics.games_completed, 1)
+                    decided_games = collect_metrics.wins + collect_metrics.losses
+                    win_rate = collect_metrics.wins / max(decided_games, 1)
+                    total_actions = sum(collect_metrics.action_counts.values())
                     self.file_logger.info(
                         f"step={global_step:>8} | rew={collect_metrics.avg_reward:>7.3f} | "
                         f"win={win_rate:>5.1%} | pol={ppo_metrics.policy_loss:>7.4f} | "
                         f"ev={ppo_metrics.explained_variance:>5.2f} | sps={collect_metrics.steps_per_second:>5.0f}"
+                    )
+                    # Debug: action breakdown and game outcomes
+                    ac = collect_metrics.action_counts
+                    self.file_logger.info(
+                        f"  actions: F={ac['fold']:>4} Ch={ac['check']:>4} Ca={ac['call']:>4} "
+                        f"R={ac['raise']:>4} A={ac['all_in']:>4} | "
+                        f"games: {collect_metrics.games_completed} done, {collect_metrics.wins}W/{collect_metrics.losses}L"
                     )
 
                 # Checkpointing
