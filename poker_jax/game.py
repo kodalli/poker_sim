@@ -99,7 +99,8 @@ def reset(
     bets = jnp.stack([bets_p0, bets_p1], axis=1)
     total_invested = jnp.stack([invested_p0, invested_p1], axis=1)
 
-    pot = sb + bb
+    # Pot starts at 0 - blinds are in bets, will be moved to pot when round advances
+    pot = jnp.zeros(n_games, dtype=jnp.int32)
 
     # In heads-up preflop, button (SB) acts first
     current_player = jnp.zeros(n_games, dtype=jnp.int32)

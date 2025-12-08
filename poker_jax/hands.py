@@ -39,12 +39,16 @@ ROYAL_FLUSH = 9
 
 
 def _encode_hand_value(category: Array, primary: Array, secondary: Array, kickers: Array) -> Array:
-    """Encode hand value as a single comparable integer."""
+    """Encode hand value as a single comparable integer.
+
+    Uses uint32 to avoid overflow for high categories (8=straight flush, 9=royal flush)
+    since category 8 << 28 = 2147483648 > max int32.
+    """
     return (
-        (category.astype(jnp.int32) << 28)
-        | (primary.astype(jnp.int32) << 20)
-        | (secondary.astype(jnp.int32) << 12)
-        | kickers.astype(jnp.int32)
+        (category.astype(jnp.uint32) << 28)
+        | (primary.astype(jnp.uint32) << 20)
+        | (secondary.astype(jnp.uint32) << 12)
+        | kickers.astype(jnp.uint32)
     )
 
 
@@ -221,6 +225,11 @@ def evaluate_hand(cards: Array) -> Array:
     quad_rank = jnp.argmax(jnp.where(rank_counts == 4, jnp.arange(13), -1))
     trip_rank = jnp.argmax(jnp.where(rank_counts == 3, jnp.arange(13), -1))
 
+    # For two trips case, also need second-highest trip
+    trips_mask = rank_counts == 3
+    second_trip_ranks = jnp.where(trips_mask & (jnp.arange(13) != trip_rank), jnp.arange(13), -1)
+    second_trip_rank = jnp.max(second_trip_ranks)
+
     # For pairs, need highest and second highest
     pair_mask = rank_counts == 2
     pair_ranks = jnp.where(pair_mask, jnp.arange(13), -1)
@@ -294,11 +303,11 @@ def evaluate_hand(cards: Array) -> Array:
     # Full house
     # Can also occur with two trips (use higher as trips, lower as pair)
     is_full_house = ((num_trips >= 1) & (num_pairs >= 1)) | (num_trips >= 2)
-    # If two trips, higher is the trips
-    fh_trips = jnp.where(num_trips >= 2, jnp.maximum(trip_rank, high_pair), trip_rank)
+    # If two trips, higher is the trips, lower is the pair
+    fh_trips = jnp.where(num_trips >= 2, trip_rank, trip_rank)
     fh_pair = jnp.where(
         num_trips >= 2,
-        jnp.minimum(trip_rank, high_pair),
+        second_trip_rank,  # Use second trip as pair when we have two trips
         jnp.maximum(high_pair, low_pair)
     )
     full_house_value = _encode_hand_value(
@@ -372,9 +381,11 @@ def determine_winner(hand_values: Array) -> Array:
 
 def hand_value_to_string(value: int) -> str:
     """Convert hand value to human-readable string."""
-    category = (value >> 28) & 0xF
-    primary = (value >> 20) & 0xFF
-    secondary = (value >> 12) & 0xFF
+    # Handle both int32 and uint32 representations
+    unsigned_val = int(value) & 0xFFFFFFFF
+    category = (unsigned_val >> 28) & 0xF
+    primary = (unsigned_val >> 20) & 0xFF
+    secondary = (unsigned_val >> 12) & 0xFF
 
     rank_names = ["2", "3", "4", "5", "6", "7", "8", "9", "T", "J", "Q", "K", "A"]
     cat_names = [

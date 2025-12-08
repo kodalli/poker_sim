@@ -51,3 +51,8 @@ packages = ["poker", "agents", "genetics", "simulation", "config", "utils", "tra
 
 [tool.hatch.build.targets.sdist]
 include = ["poker", "agents", "genetics", "simulation", "config", "utils", "training", "poker_jax", "main.py"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.1",
+]
