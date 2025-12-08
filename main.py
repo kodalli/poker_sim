@@ -329,6 +329,130 @@ def train_rl(
     console.print(f"Model saved to: models/{model}/")
 
 
+@app.command(name="train-rl-jax")
+def train_rl_jax(
+    model: str = typer.Option("v2-jax", "--model", "-m", help="Model version"),
+    steps: int = typer.Option(1_000_000, "--steps", "-s", help="Total training steps"),
+    parallel_games: int = typer.Option(1024, "--parallel", "-p", help="Parallel games on GPU"),
+    lr: float = typer.Option(3e-4, "--lr", help="Learning rate"),
+    tensorboard: Optional[str] = typer.Option("logs/jax", "--tensorboard", "-t", help="TensorBoard log directory"),
+    description: str = typer.Option("", "--desc", "-d", help="Model description"),
+    seed: Optional[int] = typer.Option(42, "--seed", help="Random seed"),
+    background: bool = typer.Option(False, "--background", "-b", help="Run in background"),
+) -> None:
+    """Train poker AI using JAX-accelerated PPO (GPU-optimized)."""
+    try:
+        import jax
+        from training.jax_trainer import JAXTrainer, JAXTrainingConfig
+        from training.jax_ppo import PPOConfig as JAXPPOConfig
+    except ImportError as e:
+        console.print(f"[red]JAX not available: {e}[/red]")
+        console.print("Install JAX with: pip install 'jax[cuda12]' flax optax")
+        raise typer.Exit(1)
+
+    console.print("\n[bold blue]JAX-Accelerated RL Training[/bold blue]")
+    console.print("=" * 50)
+
+    # Handle model versioning
+    if version_exists(model):
+        console.print(f"\n[yellow]Model {model} already exists![/yellow]")
+        console.print("Options:")
+        console.print("  1. Overwrite existing model")
+        console.print(f"  2. Create new version ({get_next_version()})")
+        console.print("  3. Cancel")
+
+        choice = typer.prompt("Choose option", default="2")
+
+        if choice == "1":
+            console.print(f"[yellow]Will overwrite {model}[/yellow]")
+        elif choice == "2":
+            model = get_next_version()
+            console.print(f"[green]Creating new version: {model}[/green]")
+        else:
+            console.print("[red]Cancelled.[/red]")
+            raise typer.Exit(0)
+
+    # Create model directory
+    create_version(model, exist_ok=True)
+    checkpoint_dir = str(get_checkpoint_dir(model))
+
+    # Check JAX device
+    devices = jax.devices()
+    console.print(f"Model version: [cyan]{model}[/cyan]")
+    console.print(f"JAX devices: [green]{devices}[/green]")
+    console.print(f"Parallel games: [cyan]{parallel_games:,}[/cyan]")
+    console.print(f"Total steps: [cyan]{steps:,}[/cyan]")
+
+    # Create configurations
+    ppo_config = JAXPPOConfig(
+        learning_rate=lr,
+        gamma=0.99,
+        lambda_=0.95,
+        epsilon=0.2,
+        ppo_epochs=4,
+        num_minibatches=4,
+        entropy_coef=0.01,
+        value_coef=0.5,
+    )
+
+    # Compute steps_per_update: aim for 64 steps per game, but ensure at least 4 updates
+    target_steps_per_update = parallel_games * 64
+    max_steps_per_update = max(steps // 4, parallel_games)  # Ensure at least 4 updates
+    steps_per_update = min(target_steps_per_update, max_steps_per_update)
+
+    training_config = JAXTrainingConfig(
+        num_parallel_games=parallel_games,
+        total_steps=steps,
+        steps_per_update=steps_per_update,
+        checkpoint_every=50_000,
+        checkpoint_dir=checkpoint_dir,
+        tensorboard_dir=tensorboard,
+    )
+
+    # Create trainer
+    trainer = JAXTrainer(
+        ppo_config=ppo_config,
+        training_config=training_config,
+        seed=seed or 42,
+        console=console,
+    )
+
+    # Run training
+    if background:
+        console.print("\n[yellow]Background mode not yet implemented.[/yellow]")
+        console.print("For now, use: nohup uv run poker-sim train-rl-jax ... &")
+        raise typer.Exit(1)
+
+    console.print(f"\n[bold]Starting JAX training for {steps:,} steps...[/bold]\n")
+
+    try:
+        metrics = trainer.train(show_progress=True)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Training interrupted.[/yellow]")
+
+    # Save metadata
+    metadata = create_metadata(
+        version=model,
+        architecture="actor_critic_jax",
+        generations=int(metrics.steps // training_config.steps_per_update),
+        population_size=parallel_games,
+        best_fitness=metrics.avg_reward,
+        description=description or f"JAX training - {steps:,} steps",
+        config={
+            "learning_rate": lr,
+            "total_steps": steps,
+            "parallel_games": parallel_games,
+            "training_method": "ppo_jax",
+            "steps_per_second": metrics.steps_per_second,
+        },
+    )
+    save_metadata(model, metadata)
+
+    console.print(f"\n[green]Training complete![/green]")
+    console.print(f"Model saved to: models/{model}/")
+    console.print(f"Steps/sec: [cyan]{metrics.steps_per_second:.0f}[/cyan]")
+
+
 @app.command()
 def evaluate(
     checkpoint: str = typer.Argument(..., help="Path to checkpoint file"),

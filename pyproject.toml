@@ -13,6 +13,10 @@ dependencies = [
     "rich>=13.7.0",
     "matplotlib>=3.9.0",
     "pyyaml>=6.0.0",
+    "jax[cuda12]>=0.4.20",
+    "flax>=0.8.0",
+    "optax>=0.2.0",
+    "tensorboard>=2.15.0",
 ]
 
 [project.optional-dependencies]
@@ -43,7 +47,7 @@ strict = true
 testpaths = ["tests"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["poker", "agents", "genetics", "simulation", "config", "utils"]
+packages = ["poker", "agents", "genetics", "simulation", "config", "utils", "training", "poker_jax"]
 
 [tool.hatch.build.targets.sdist]
-include = ["poker", "agents", "genetics", "simulation", "config", "utils", "main.py"]
+include = ["poker", "agents", "genetics", "simulation", "config", "utils", "training", "poker_jax", "main.py"]
