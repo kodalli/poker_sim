@@ -25,6 +25,7 @@ dev = [
 
 [project.scripts]
 poker-sim = "main:app"
+poker-play = "main:play_human"
 
 [build-system]
 requires = ["hatchling"]

@@ -159,8 +159,15 @@ class Population:
         torch.save(state, path)
 
     def load(self, path: str) -> None:
-        """Load population state from file."""
-        state = torch.load(path, map_location=self.device)
+        """Load population state from file.
+
+        Handles both direct population state and evolution engine checkpoint formats.
+        """
+        state = torch.load(path, map_location=self.device, weights_only=False)
+
+        # Handle evolution engine checkpoint format (has 'population_state' wrapper)
+        if "population_state" in state:
+            state = state["population_state"]
 
         self.generation = state["generation"]
         self.size = state["size"]

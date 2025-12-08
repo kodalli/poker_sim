@@ -1,13 +1,14 @@
 """Poker simulation with genetic algorithm AI evolution."""
 
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import typer
 from rich.console import Console
 from rich.table import Table
 
+from agents.base import BaseAgent
 from agents.neural.encoding import StateEncoder
 from agents.neural.network import NetworkConfig, create_network
 from agents.random_agent import RandomAgent, TightAggressiveAgent
@@ -18,9 +19,14 @@ from genetics.fitness import FitnessConfig
 from genetics.mutation import AdaptiveMutation
 from genetics.population import Population
 from genetics.selection import TournamentSelection
+from poker.player import ActionType, Player, PlayerAction
+from poker.table import TableState
 from simulation.runner import GameRunner, SimulationConfig
 from simulation.statistics import StatisticsTracker
 from utils.device import get_device, print_device_info
+
+if TYPE_CHECKING:
+    from agents.neural.agent import NeuralAgent
 
 app = typer.Typer(
     name="poker-sim",
@@ -201,14 +207,208 @@ def evaluate(
     console.print(table)
 
 
+class DebugNeuralAgent(BaseAgent):
+    """Wrapper that displays AI decision details after each action."""
+
+    def __init__(
+        self,
+        agent: "NeuralAgent",
+        console_: Console,
+    ) -> None:
+        super().__init__(agent.name)
+        self._agent = agent
+        self._console = console_
+        self._last_action: PlayerAction | None = None
+        self._last_probs: dict[ActionType, float] | None = None
+        self._last_bet_fraction: float | None = None
+
+    def decide(self, table_state: TableState) -> PlayerAction:
+        # Get action from underlying agent
+        action = self._agent.decide(table_state)
+
+        # Get probabilities for display
+        probs = self._agent.get_action_distribution(table_state)
+
+        # Calculate bet fraction if raising
+        bet_fraction = None
+        if action.action_type == ActionType.RAISE:
+            bet_range = table_state.max_raise - table_state.min_raise
+            if bet_range > 0:
+                bet_fraction = (action.amount - table_state.min_raise) / bet_range
+
+        # Store for display
+        self._last_action = action
+        self._last_probs = probs
+        self._last_bet_fraction = bet_fraction
+
+        # Display decision
+        from ui.display import render_ai_decision
+        panel = render_ai_decision(action, probs, bet_fraction)
+        self._console.print(panel)
+
+        return action
+
+    def notify_hand_result(self, chip_delta: int, won: bool) -> None:
+        self._agent.notify_hand_result(chip_delta, won)
+
+    def notify_game_end(self, final_chips: int) -> None:
+        self._agent.notify_game_end(final_chips)
+
+
+def _run_human_game(
+    checkpoint_path: str,
+    max_hands: int,
+    cpu: bool,
+) -> None:
+    """Run interactive human vs AI game."""
+    from poker.game import TexasHoldemGame
+    from agents.human_agent import HumanAgent
+    from ui.display import clear_screen, print_divider, render_hand_result
+
+    device = get_device(prefer_cuda=not cpu)
+
+    # Load AI from checkpoint
+    if not Path(checkpoint_path).exists():
+        console.print(f"[red]Checkpoint not found: {checkpoint_path}[/red]")
+        console.print("[yellow]Run 'uv run python main.py train' first to train an AI.[/yellow]")
+        raise typer.Exit(1)
+
+    console.print(f"Loading AI from: [cyan]{checkpoint_path}[/cyan]")
+    pop = Population(size=1, device=device)
+    pop.load(checkpoint_path)
+    best = pop.get_best_individuals(1)[0]
+
+    # Create agents
+    ai_agent = pop.get_agent(best, temperature=0.3)  # Lower temp for more deterministic
+    ai_agent.name = "AI"
+    debug_ai = DebugNeuralAgent(ai_agent, console)
+
+    human_agent = HumanAgent(name="You", console=console)
+
+    # Game settings
+    small_blind = 1
+    big_blind = 2
+    starting_chips = 200
+
+    # Create players (human is player 0, AI is player 1)
+    players = [
+        Player(id=0, chips=starting_chips, name="You"),
+        Player(id=1, chips=starting_chips, name="AI"),
+    ]
+
+    agents_dict = {0: human_agent, 1: debug_ai}
+    agents_list = [human_agent, debug_ai]
+
+    dealer_position = 0
+    hands_played = 0
+
+    console.print("\n[bold green]Game started![/bold green]")
+    console.print(f"Starting chips: {starting_chips} | Blinds: {small_blind}/{big_blind}")
+    console.print("[dim]Type 'q' to quit at any time.[/dim]\n")
+    print_divider(console, "=")
+
+    try:
+        while hands_played < max_hands:
+            # Check if game over
+            active_players = [p for p in players if p.chips > 0]
+            if len(active_players) <= 1:
+                break
+
+            hands_played += 1
+            console.print(f"\n[bold]Hand #{hands_played}[/bold]")
+            print_divider(console)
+
+            # Play a hand
+            game = TexasHoldemGame(
+                players=active_players,
+                dealer_position=dealer_position % len(active_players),
+                small_blind=small_blind,
+                big_blind=big_blind,
+            )
+
+            result = game.play(agents_dict)
+
+            # Show hand result
+            human_delta = result.chip_changes.get(0, 0)
+            human_won = 0 in result.winners
+
+            # Get winning hand description if showdown
+            winning_hand = None
+            if result.showdown_hands and result.winning_hand:
+                winning_hand = str(result.winning_hand.rank.name.replace("_", " ").title())
+
+            result_panel = render_hand_result(
+                won=human_won,
+                chip_delta=human_delta,
+                my_chips=players[0].chips,
+                opponent_chips=players[1].chips,
+                showdown=not result.all_folded,
+                winning_hand=winning_hand,
+            )
+            console.print(result_panel)
+
+            # Notify agents
+            for i, agent in enumerate(agents_list):
+                chip_delta = result.chip_changes.get(i, 0)
+                won = i in result.winners
+                agent.notify_hand_result(chip_delta, won)
+
+            # Rotate dealer
+            dealer_position = (dealer_position + 1) % 2
+
+            # Pause between hands
+            if hands_played < max_hands and len([p for p in players if p.chips > 0]) > 1:
+                console.print("\n[dim]Press Enter for next hand (or 'q' to quit)...[/dim]")
+                try:
+                    inp = input()
+                    if inp.lower() in ('q', 'quit', 'exit'):
+                        break
+                except EOFError:
+                    break
+
+    except KeyboardInterrupt:
+        console.print("\n\n[yellow]Game interrupted.[/yellow]")
+
+    # Final results
+    console.print("\n")
+    print_divider(console, "=")
+    console.print("[bold]Final Results[/bold]")
+    print_divider(console)
+
+    for i, agent in enumerate(agents_list):
+        chips = players[i].chips
+        delta = chips - starting_chips
+        delta_str = f"+{delta}" if delta > 0 else str(delta)
+        delta_style = "green" if delta > 0 else "red" if delta < 0 else "white"
+        console.print(f"{agent.name}: {chips} chips ([{delta_style}]{delta_str}[/{delta_style}])")
+
+    # Determine winner
+    if players[0].chips > players[1].chips:
+        console.print("\n[bold green]You win![/bold green]")
+    elif players[1].chips > players[0].chips:
+        console.print("\n[bold red]AI wins![/bold red]")
+    else:
+        console.print("\n[bold yellow]It's a tie![/bold yellow]")
+
+
 @app.command()
 def play(
     checkpoint: Optional[str] = typer.Option(None, "--checkpoint", "-c", help="Load trained agent"),
     num_players: int = typer.Option(6, "--players", "-p", help="Number of players (2-10)"),
     hands: int = typer.Option(10, "--hands", "-n", help="Number of hands to play"),
     cpu: bool = typer.Option(False, "--cpu", help="Force CPU"),
+    human: bool = typer.Option(False, "--human", "-H", help="Play as human against AI"),
 ) -> None:
-    """Watch AI agents play poker."""
+    """Play poker - watch AI or play as human."""
+    if human:
+        # Human vs AI mode
+        checkpoint_path = checkpoint or "checkpoints/final.pt"
+        console.print("\n[bold blue]Human vs AI Poker[/bold blue]")
+        console.print("=" * 50)
+        _run_human_game(checkpoint_path, hands, cpu)
+        return
+
+    # Watch mode (existing behavior)
     console.print("\n[bold blue]Poker Game[/bold blue]")
     console.print("=" * 50)
 
@@ -322,6 +522,17 @@ def benchmark(
 def main() -> None:
     """Entry point."""
     app()
+
+
+def play_human() -> None:
+    """Entry point for human vs AI play mode."""
+    console.print("\n[bold blue]Human vs AI Poker[/bold blue]")
+    console.print("=" * 50)
+    _run_human_game(
+        checkpoint_path="checkpoints/final.pt",
+        max_hands=50,
+        cpu=False,
+    )
 
 
 if __name__ == "__main__":
