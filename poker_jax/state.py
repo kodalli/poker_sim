@@ -80,14 +80,31 @@ class GameState(NamedTuple):
     # === Random state ===
     rng_key: Array  # [N, 2] PRNG keys
 
+    # === Action history (v3) ===
+    # Stores last MAX_HISTORY actions: [N, MAX_HISTORY, 3]
+    # Each action: [player_id, action_type, bet_amount_normalized]
+    action_history: Array  # [N, 10, 3]
+    history_len: Array  # [N] number of actions recorded this hand
+
 
 # Action constants
 ACTION_NONE = 0
 ACTION_FOLD = 1
 ACTION_CHECK = 2
 ACTION_CALL = 3
-ACTION_RAISE = 4
-ACTION_ALL_IN = 5
+ACTION_RAISE_33 = 4   # 33% pot (probe/blocking bet)
+ACTION_RAISE_66 = 5   # 66% pot (standard bet)
+ACTION_RAISE_100 = 6  # 100% pot (polarized)
+ACTION_RAISE_150 = 7  # 150% pot (overbet)
+ACTION_ALL_IN = 8
+
+# For backwards compat and simple raise references
+ACTION_RAISE = ACTION_RAISE_66  # Default raise is 66% pot
+
+NUM_ACTIONS = 9  # Total action count for network output
+
+# Action history constants
+MAX_HISTORY = 10  # Track last 10 actions
 
 # Round constants
 ROUND_PREFLOP = 0
@@ -151,6 +168,9 @@ def create_initial_state(
         starting_chips=jnp.full(n_games, starting_chips, dtype=jnp.int32),
         # RNG
         rng_key=keys,
+        # Action history (v3)
+        action_history=jnp.zeros((n_games, MAX_HISTORY, 3), dtype=jnp.float32),
+        history_len=jnp.zeros(n_games, dtype=jnp.int32),
     )
 
 
@@ -158,11 +178,11 @@ def get_valid_actions_mask(state: GameState) -> Array:
     """Get mask of valid actions for current player in each game.
 
     Returns:
-        [N, 6] bool mask where True = action is valid
-        Actions: 0=none (invalid), 1=fold, 2=check, 3=call, 4=raise, 5=all_in
+        [N, NUM_ACTIONS] bool mask where True = action is valid
+        Actions: 0=none, 1=fold, 2=check, 3=call, 4-7=raise sizes, 8=all_in
     """
     n_games = state.done.shape[0]
-    mask = jnp.zeros((n_games, 6), dtype=jnp.bool_)
+    mask = jnp.zeros((n_games, NUM_ACTIONS), dtype=jnp.bool_)
 
     # Get current player's state
     player_idx = state.current_player
@@ -182,6 +202,9 @@ def get_valid_actions_mask(state: GameState) -> Array:
     # Amount needed to call
     to_call = opp_bet - my_bet
 
+    # Current pot for raise calculations
+    pot = state.pot + state.bets[:, 0] + state.bets[:, 1]
+
     # Can always fold if game not done
     can_fold = ~state.done
 
@@ -191,10 +214,21 @@ def get_valid_actions_mask(state: GameState) -> Array:
     # Can call if there's a bet to call and we have chips
     can_call = ~state.done & (to_call > 0) & (my_chips >= to_call)
 
-    # Can raise if we have more than enough to call
     # Min raise = last raise amount (or big blind)
     min_raise_total = opp_bet + state.last_raise_amount
-    can_raise = ~state.done & (my_chips > to_call) & (my_chips + my_bet >= min_raise_total)
+
+    # For each raise size, check if player can afford it
+    # Raise = opp_bet + (pot * fraction), but at least min_raise_total
+    def can_make_raise(fraction):
+        raise_amount = jnp.maximum(opp_bet + (pot * fraction).astype(jnp.int32), min_raise_total)
+        chips_needed = raise_amount - my_bet
+        # Can raise if: not done, have more than call amount, and can afford this size (but not all-in)
+        return ~state.done & (my_chips > to_call) & (my_chips >= chips_needed) & (my_chips > chips_needed)
+
+    can_raise_33 = can_make_raise(0.33)
+    can_raise_66 = can_make_raise(0.66)
+    can_raise_100 = can_make_raise(1.0)
+    can_raise_150 = can_make_raise(1.5)
 
     # Can go all-in if we have chips
     can_all_in = ~state.done & (my_chips > 0)
@@ -203,7 +237,10 @@ def get_valid_actions_mask(state: GameState) -> Array:
     mask = mask.at[:, ACTION_FOLD].set(can_fold)
     mask = mask.at[:, ACTION_CHECK].set(can_check)
     mask = mask.at[:, ACTION_CALL].set(can_call)
-    mask = mask.at[:, ACTION_RAISE].set(can_raise)
+    mask = mask.at[:, ACTION_RAISE_33].set(can_raise_33)
+    mask = mask.at[:, ACTION_RAISE_66].set(can_raise_66)
+    mask = mask.at[:, ACTION_RAISE_100].set(can_raise_100)
+    mask = mask.at[:, ACTION_RAISE_150].set(can_raise_150)
     mask = mask.at[:, ACTION_ALL_IN].set(can_all_in)
 
     return mask

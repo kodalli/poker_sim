@@ -15,8 +15,12 @@ from poker_jax.state import (
     ACTION_FOLD,
     ACTION_CHECK,
     ACTION_CALL,
-    ACTION_RAISE,
+    ACTION_RAISE_33,
+    ACTION_RAISE_66,
+    ACTION_RAISE_100,
+    ACTION_RAISE_150,
     ACTION_ALL_IN,
+    MAX_HISTORY,
     ROUND_PREFLOP,
     ROUND_FLOP,
     ROUND_TURN,
@@ -34,6 +38,103 @@ from poker_jax.hands import evaluate_hands_batch, determine_winner
 
 
 from functools import partial
+
+# Raise fractions for pot-relative betting
+RAISE_FRACTIONS = {
+    ACTION_RAISE_33: 0.33,
+    ACTION_RAISE_66: 0.66,
+    ACTION_RAISE_100: 1.0,
+    ACTION_RAISE_150: 1.5,
+}
+
+
+@jax.jit
+def _compute_raise_amount(state: GameState, action: Array) -> Array:
+    """Compute raise amount based on action type (pot-relative).
+
+    Args:
+        state: Current game state
+        action: [N] action indices
+
+    Returns:
+        [N] raise amounts (total bet size)
+    """
+    n_games = state.done.shape[0]
+    game_idx = jnp.arange(n_games)
+
+    player_idx = state.current_player
+    my_bet = state.bets[game_idx, player_idx]
+    opp_bet = state.bets[game_idx, 1 - player_idx]
+
+    # Current pot
+    pot = state.pot + state.bets[:, 0] + state.bets[:, 1]
+
+    # Min raise floor
+    min_raise_total = opp_bet + state.last_raise_amount
+
+    # Compute raise amount for each fraction
+    # raise_amount = opp_bet + pot * fraction
+    raise_33 = jnp.maximum(opp_bet + (pot * 0.33).astype(jnp.int32), min_raise_total)
+    raise_66 = jnp.maximum(opp_bet + (pot * 0.66).astype(jnp.int32), min_raise_total)
+    raise_100 = jnp.maximum(opp_bet + (pot * 1.0).astype(jnp.int32), min_raise_total)
+    raise_150 = jnp.maximum(opp_bet + (pot * 1.5).astype(jnp.int32), min_raise_total)
+
+    # Select based on action
+    raise_amount = jnp.where(action == ACTION_RAISE_33, raise_33,
+                   jnp.where(action == ACTION_RAISE_66, raise_66,
+                   jnp.where(action == ACTION_RAISE_100, raise_100,
+                   jnp.where(action == ACTION_RAISE_150, raise_150,
+                             min_raise_total))))  # Default fallback
+
+    return raise_amount
+
+
+@jax.jit
+def _record_action(state: GameState, actions: Array, bet_amounts: Array) -> GameState:
+    """Record action in history.
+
+    Args:
+        state: Current game state
+        actions: [N] action indices taken
+        bet_amounts: [N] bet amounts (for raises)
+
+    Returns:
+        Updated state with action recorded in history
+    """
+    n_games = state.done.shape[0]
+    game_idx = jnp.arange(n_games)
+
+    # Normalize bet amount by starting chips
+    norm = state.starting_chips.astype(jnp.float32)
+    bet_normalized = bet_amounts / norm
+
+    # Current history position (clamped to MAX_HISTORY - 1 for safety)
+    hist_idx = jnp.minimum(state.history_len, MAX_HISTORY - 1)
+
+    # Create action record: [player_id, action_type_normalized, bet_amount_normalized]
+    player_id = state.current_player.astype(jnp.float32)
+    action_normalized = actions.astype(jnp.float32) / 8.0  # Normalize to ~[0, 1]
+
+    # Update history at current position
+    # Only update if we haven't filled history yet
+    should_update = state.history_len < MAX_HISTORY
+
+    new_history = state.action_history
+    new_history = new_history.at[game_idx, hist_idx, 0].set(
+        jnp.where(should_update, player_id, state.action_history[game_idx, hist_idx, 0])
+    )
+    new_history = new_history.at[game_idx, hist_idx, 1].set(
+        jnp.where(should_update, action_normalized, state.action_history[game_idx, hist_idx, 1])
+    )
+    new_history = new_history.at[game_idx, hist_idx, 2].set(
+        jnp.where(should_update, bet_normalized, state.action_history[game_idx, hist_idx, 2])
+    )
+
+    # Increment history length
+    new_history_len = jnp.minimum(state.history_len + 1, MAX_HISTORY)
+
+    return state._replace(action_history=new_history, history_len=new_history_len)
+
 
 @partial(jax.jit, static_argnums=(1, 2, 3, 4))
 def reset(
@@ -401,20 +502,29 @@ def step(
 
     Args:
         state: Current game state for N games
-        actions: [N] action indices (1=fold, 2=check, 3=call, 4=raise, 5=all_in)
+        actions: [N] action indices (1=fold, 2=check, 3=call, 4-7=raise sizes, 8=all_in)
         raise_amounts: [N] raise amounts for raise actions (total bet, not additional)
-                       Only used when action is RAISE
+                       If None, computed automatically from action type (pot-relative)
 
     Returns:
         Updated game state
     """
     n_games = state.done.shape[0]
+    game_idx = jnp.arange(n_games)
 
+    # Compute raise amounts based on action type (pot-relative)
+    computed_raise_amounts = _compute_raise_amount(state, actions)
     if raise_amounts is None:
-        # Default raise: min-raise
-        opp_idx = 1 - state.current_player
-        opp_bet = state.bets[jnp.arange(n_games), opp_idx]
-        raise_amounts = opp_bet + state.last_raise_amount
+        raise_amounts = computed_raise_amounts
+    else:
+        # Use computed for pot-relative raises, provided for legacy
+        is_pot_relative = (
+            (actions == ACTION_RAISE_33) |
+            (actions == ACTION_RAISE_66) |
+            (actions == ACTION_RAISE_100) |
+            (actions == ACTION_RAISE_150)
+        )
+        raise_amounts = jnp.where(is_pot_relative, computed_raise_amounts, raise_amounts)
 
     # Mask for games that aren't done
     active = ~state.done
@@ -423,7 +533,12 @@ def step(
     is_fold = (actions == ACTION_FOLD) & active
     is_check = (actions == ACTION_CHECK) & active
     is_call = (actions == ACTION_CALL) & active
-    is_raise = (actions == ACTION_RAISE) & active
+    is_raise = (
+        (actions == ACTION_RAISE_33) |
+        (actions == ACTION_RAISE_66) |
+        (actions == ACTION_RAISE_100) |
+        (actions == ACTION_RAISE_150)
+    ) & active
     is_all_in = (actions == ACTION_ALL_IN) & active
 
     # Apply actions
@@ -435,6 +550,16 @@ def step(
 
     # Track actions and switch player
     any_action = is_fold | is_check | is_call | is_raise | is_all_in
+
+    # Record action in history (get bet amount for history)
+    # For raises, use raise_amounts; for all-in, use player's chips; for others, use 0
+    my_bet_after = state.bets[game_idx, state.current_player]
+    bet_for_history = jnp.where(is_raise, raise_amounts,
+                      jnp.where(is_all_in, my_bet_after,
+                      jnp.where(is_call, my_bet_after,
+                                jnp.zeros(n_games, dtype=jnp.int32))))
+    state = _record_action(state, actions, bet_for_history.astype(jnp.float32))
+
     actions_this_round = jnp.where(
         any_action, state.actions_this_round + 1, state.actions_this_round
     )

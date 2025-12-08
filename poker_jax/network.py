@@ -15,12 +15,16 @@ class ActorCriticMLP(nn.Module):
 
     Architecture:
     - Shared backbone: obs -> hidden layers -> features
-    - Actor head: features -> action_logits (5) + bet_fraction (1)
+    - Actor head: features -> action_logits (9) + bet_fraction (1)
     - Critic head: features -> value (1)
+
+    v3 changes:
+    - Increased hidden dims for more capacity
+    - 9 actions: fold, check, call, raise_33, raise_66, raise_100, raise_150, all_in
     """
 
-    hidden_dims: Sequence[int] = (256, 128, 64)
-    num_actions: int = 5  # fold, check, call, raise, all_in
+    hidden_dims: Sequence[int] = (512, 256, 128)  # Bigger for v3
+    num_actions: int = 9  # v3: 9 discrete actions
     dropout_rate: float = 0.1
 
     @nn.compact
@@ -28,13 +32,13 @@ class ActorCriticMLP(nn.Module):
         """Forward pass.
 
         Args:
-            x: [batch, OBS_DIM] observations
+            x: [batch, OBS_DIM] observations (433 dims in v3)
             training: Whether in training mode (affects dropout)
 
         Returns:
             Tuple of:
-                action_logits: [batch, 5] logits for each action
-                bet_fraction: [batch, 1] bet sizing (0-1)
+                action_logits: [batch, 9] logits for each action
+                bet_fraction: [batch, 1] bet sizing (0-1, unused in v3)
                 value: [batch, 1] state value estimate
         """
         # Shared backbone

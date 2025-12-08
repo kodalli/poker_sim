@@ -117,7 +117,9 @@ class TrainingMetrics:
     losses: int = 0  # Track losses for accurate win rate
     total_pot_won: float = 0.0
     action_counts: dict = field(default_factory=lambda: {
-        "fold": 0, "check": 0, "call": 0, "raise": 0, "all_in": 0
+        "fold": 0, "check": 0, "call": 0,
+        "raise_33": 0, "raise_66": 0, "raise_100": 0, "raise_150": 0,
+        "all_in": 0
     })
 
 
@@ -277,8 +279,18 @@ class JAXTrainer:
         wins = 0
         losses = 0
         total_pot_won = 0.0
-        action_counts = {"fold": 0, "check": 0, "call": 0, "raise": 0, "all_in": 0}
-        action_names = ["fold", "check", "call", "raise", "all_in"]
+        # v3: 9 actions (indices 1-8, 0 is ACTION_NONE)
+        action_counts = {
+            "fold": 0, "check": 0, "call": 0,
+            "raise_33": 0, "raise_66": 0, "raise_100": 0, "raise_150": 0,
+            "all_in": 0
+        }
+        # Map action index to name (ACTION_FOLD=1, ..., ACTION_ALL_IN=8)
+        action_idx_to_name = {
+            1: "fold", 2: "check", 3: "call",
+            4: "raise_33", 5: "raise_66", 6: "raise_100", 7: "raise_150",
+            8: "all_in"
+        }
 
         start_time = time.time()
 
@@ -304,10 +316,10 @@ class JAXTrainer:
             total_rewards += float(rewards.sum())
             total_game_steps += int(n_games - completed)
 
-            # Track action distribution
+            # Track action distribution (v3: actions are 1-8)
             actions_np = jnp.asarray(actions)
-            for i, name in enumerate(action_names):
-                action_counts[name] += int((actions_np == i).sum())
+            for idx, name in action_idx_to_name.items():
+                action_counts[name] += int((actions_np == idx).sum())
 
             # Track wins and losses (only when game ends on this player's action)
             done_mask = dones > 0.5
@@ -434,13 +446,15 @@ class JAXTrainer:
 
                 if self.logger and (update_idx + 1) % config.log_every == 0:
                     # Compute derived metrics
-                    total_actions = sum(collect_metrics.action_counts.values())
+                    ac = collect_metrics.action_counts
+                    total_actions = sum(ac.values())
                     # Win rate: when I ended the game, how often did I win?
                     decided_games = collect_metrics.wins + collect_metrics.losses
                     win_rate = collect_metrics.wins / max(decided_games, 1)
-                    fold_rate = collect_metrics.action_counts["fold"] / max(total_actions, 1)
-                    raise_count = collect_metrics.action_counts["raise"] + collect_metrics.action_counts["all_in"]
-                    call_count = collect_metrics.action_counts["call"]
+                    fold_rate = ac["fold"] / max(total_actions, 1)
+                    # v3: Sum all raise types for aggression
+                    raise_count = ac["raise_33"] + ac["raise_66"] + ac["raise_100"] + ac["raise_150"] + ac["all_in"]
+                    call_count = ac["call"]
                     aggression = raise_count / max(call_count, 1)
 
                     self.logger.log(global_step, {
@@ -454,23 +468,27 @@ class JAXTrainer:
                         # PPO diagnostics
                         "ppo/approx_kl": ppo_metrics.approx_kl,
                         "ppo/clip_fraction": ppo_metrics.clip_fraction,
-                        # RL diagnostics (new)
+                        # RL diagnostics
                         "rl/explained_variance": ppo_metrics.explained_variance,
                         "rl/grad_norm": ppo_metrics.grad_norm,
                         "rl/value_pred_error": ppo_metrics.value_pred_error,
                         # Performance
                         "perf/steps_per_second": collect_metrics.steps_per_second,
                         "perf/games_per_second": collect_metrics.games_per_second,
-                        # Poker behavior (new)
+                        # Poker behavior
                         "poker/win_rate": win_rate,
                         "poker/avg_pot_won": collect_metrics.total_pot_won / max(collect_metrics.wins, 1),
                         "poker/fold_rate": fold_rate,
                         "poker/aggression": aggression,
-                        "poker/action_fold": collect_metrics.action_counts["fold"] / max(total_actions, 1),
-                        "poker/action_check": collect_metrics.action_counts["check"] / max(total_actions, 1),
-                        "poker/action_call": collect_metrics.action_counts["call"] / max(total_actions, 1),
-                        "poker/action_raise": collect_metrics.action_counts["raise"] / max(total_actions, 1),
-                        "poker/action_allin": collect_metrics.action_counts["all_in"] / max(total_actions, 1),
+                        # v3: All 8 action types
+                        "poker/action_fold": ac["fold"] / max(total_actions, 1),
+                        "poker/action_check": ac["check"] / max(total_actions, 1),
+                        "poker/action_call": ac["call"] / max(total_actions, 1),
+                        "poker/action_raise_33": ac["raise_33"] / max(total_actions, 1),
+                        "poker/action_raise_66": ac["raise_66"] / max(total_actions, 1),
+                        "poker/action_raise_100": ac["raise_100"] / max(total_actions, 1),
+                        "poker/action_raise_150": ac["raise_150"] / max(total_actions, 1),
+                        "poker/action_allin": ac["all_in"] / max(total_actions, 1),
                     })
 
                 # File logging (persist progress for long runs) - reduced frequency
@@ -483,11 +501,12 @@ class JAXTrainer:
                         f"win={win_rate:>5.1%} | pol={ppo_metrics.policy_loss:>7.4f} | "
                         f"ev={ppo_metrics.explained_variance:>5.2f} | sps={collect_metrics.steps_per_second:>5.0f}"
                     )
-                    # Debug: action breakdown and game outcomes
+                    # Debug: action breakdown and game outcomes (v3: 8 action types)
                     ac = collect_metrics.action_counts
+                    total_raises = ac['raise_33'] + ac['raise_66'] + ac['raise_100'] + ac['raise_150']
                     self.file_logger.info(
                         f"  actions: F={ac['fold']:>4} Ch={ac['check']:>4} Ca={ac['call']:>4} "
-                        f"R={ac['raise']:>4} A={ac['all_in']:>4} | "
+                        f"R33={ac['raise_33']:>3} R66={ac['raise_66']:>3} R100={ac['raise_100']:>3} R150={ac['raise_150']:>3} A={ac['all_in']:>4} | "
                         f"games: {collect_metrics.games_completed} done, {collect_metrics.wins}W/{collect_metrics.losses}L"
                     )
 

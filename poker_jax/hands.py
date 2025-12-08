@@ -379,6 +379,205 @@ def determine_winner(hand_values: Array) -> Array:
     return winner
 
 
+@jax.jit
+def get_hand_category(hand_value: Array) -> Array:
+    """Extract hand category (0-9) from encoded hand value.
+
+    Args:
+        hand_value: Encoded hand value from evaluate_hand()
+
+    Returns:
+        Hand category: 0=high card, 1=pair, ..., 9=royal flush
+    """
+    return (hand_value.astype(jnp.uint32) >> 28) & 0xF
+
+
+@jax.jit
+def has_flush_draw(cards: Array) -> Array:
+    """Check if hand has a flush draw (4 cards of same suit).
+
+    Args:
+        cards: [7] card indices
+
+    Returns:
+        Boolean indicating flush draw
+    """
+    suit_counts = _count_suits(cards)
+    return jnp.max(suit_counts) == 4
+
+
+@jax.jit
+def has_backdoor_flush_draw(cards: Array) -> Array:
+    """Check if hand has a backdoor flush draw (3 cards of same suit).
+
+    Args:
+        cards: [7] card indices
+
+    Returns:
+        Boolean indicating backdoor flush draw
+    """
+    suit_counts = _count_suits(cards)
+    return jnp.max(suit_counts) == 3
+
+
+@jax.jit
+def count_straight_outs(cards: Array) -> Array:
+    """Count outs to make a straight.
+
+    Args:
+        cards: [7] card indices
+
+    Returns:
+        Number of straight outs (0, 4 for gutshot, 8 for OESD)
+    """
+    rank_counts = _count_ranks(cards)
+    has_rank = rank_counts > 0
+
+    # Check for open-ended straight draw (4 consecutive + gaps on both ends)
+    # OESD patterns: e.g., 5-6-7-8 with 4 and 9 available = 8 outs
+    is_oesd = jnp.zeros((), dtype=jnp.bool_)
+    is_gutshot = jnp.zeros((), dtype=jnp.bool_)
+
+    # Check all 4-card sequences
+    for start in range(10):  # Can start from 0 (2) to 9 (J)
+        end = start + 4
+        if end <= 13:
+            # Count how many of these 4 consecutive ranks we have
+            consecutive_count = jnp.sum(has_rank[start:end])
+
+            # 4 consecutive = open-ended straight draw
+            is_4_consecutive = consecutive_count == 4
+
+            # Check if both ends are open (not at edges)
+            can_complete_low = (start > 0) | ((start == 0) & has_rank[12])  # A-low straight
+            can_complete_high = end < 13
+
+            oesd_here = is_4_consecutive & can_complete_low & can_complete_high
+            is_oesd = is_oesd | oesd_here
+
+            # Gutshot: 4 cards in 5-card span with one gap
+            if end < 13:
+                span_5 = jnp.sum(has_rank[start:end + 1])
+                gutshot_here = (span_5 == 4) & ~is_4_consecutive
+                is_gutshot = is_gutshot | gutshot_here
+
+    # Also check A-high gutshots (T-J-Q-K-A missing one)
+    broadway = has_rank[8:13]  # T, J, Q, K, A
+    broadway_count = jnp.sum(broadway)
+    broadway_gutshot = broadway_count == 4
+    is_gutshot = is_gutshot | broadway_gutshot
+
+    # OESD = 8 outs, gutshot = 4 outs
+    outs = jnp.where(is_oesd, 8, jnp.where(is_gutshot, 4, 0))
+    return outs
+
+
+@jax.jit
+def get_board_texture(community: Array) -> tuple[Array, Array, Array]:
+    """Analyze board texture.
+
+    Args:
+        community: [5] community cards (-1 for undealt)
+
+    Returns:
+        Tuple of (is_paired, is_monotone, is_connected)
+    """
+    valid = community >= 0
+    n_cards = jnp.sum(valid)
+
+    # Only analyze if we have cards
+    rank_counts = _count_ranks(community)
+    suit_counts = _count_suits(community)
+
+    # Board is paired if any rank appears 2+ times
+    is_paired = jnp.any(rank_counts >= 2)
+
+    # Board is monotone if 3+ cards of same suit
+    is_monotone = jnp.any(suit_counts >= 3)
+
+    # Board is connected if 3+ cards within 4-rank span
+    has_rank = rank_counts > 0
+    is_connected = jnp.zeros((), dtype=jnp.bool_)
+    for start in range(10):  # Check 4-rank spans
+        span_count = jnp.sum(has_rank[start:start + 4])
+        is_connected = is_connected | (span_count >= 3)
+
+    return is_paired, is_monotone, is_connected
+
+
+@jax.jit
+def compute_hand_strength_features(hole_cards: Array, community: Array) -> Array:
+    """Compute hand strength features for neural network input.
+
+    Args:
+        hole_cards: [2] hole cards for one player
+        community: [5] community cards
+
+    Returns:
+        [18] feature vector:
+            - [0:10] hand category one-hot
+            - [10] normalized hand strength (category / 9)
+            - [11] has flush draw
+            - [12] has OESD (8 outs)
+            - [13] has gutshot (4 outs)
+            - [14] has backdoor flush draw
+            - [15] board is paired
+            - [16] board is monotone
+            - [17] board is connected
+    """
+    # Combine cards
+    cards = jnp.concatenate([hole_cards, community])
+
+    # Evaluate hand
+    hand_value = evaluate_hand(cards)
+    category = get_hand_category(hand_value)
+
+    # Hand category one-hot
+    category_one_hot = jax.nn.one_hot(category, 10)
+
+    # Normalized strength
+    normalized_strength = category.astype(jnp.float32) / 9.0
+
+    # Draw detection
+    flush_draw = has_flush_draw(cards).astype(jnp.float32)
+    straight_outs = count_straight_outs(cards)
+    has_oesd = (straight_outs >= 8).astype(jnp.float32)
+    has_gutshot = ((straight_outs >= 4) & (straight_outs < 8)).astype(jnp.float32)
+    backdoor_flush = has_backdoor_flush_draw(cards).astype(jnp.float32)
+
+    # Board texture
+    is_paired, is_monotone, is_connected = get_board_texture(community)
+
+    # Combine all features
+    features = jnp.concatenate([
+        category_one_hot,                          # 10 dims
+        jnp.array([normalized_strength]),          # 1 dim
+        jnp.array([flush_draw]),                   # 1 dim
+        jnp.array([has_oesd]),                     # 1 dim
+        jnp.array([has_gutshot]),                  # 1 dim
+        jnp.array([backdoor_flush]),               # 1 dim
+        jnp.array([is_paired.astype(jnp.float32)]),     # 1 dim
+        jnp.array([is_monotone.astype(jnp.float32)]),   # 1 dim
+        jnp.array([is_connected.astype(jnp.float32)]),  # 1 dim
+    ])
+
+    return features
+
+
+@jax.jit
+def compute_hand_strength_batch(hole_cards: Array, community: Array) -> Array:
+    """Compute hand strength features for batch of games.
+
+    Args:
+        hole_cards: [N, 2] hole cards
+        community: [N, 5] community cards
+
+    Returns:
+        [N, 18] hand strength features
+    """
+    return jax.vmap(compute_hand_strength_features)(hole_cards, community)
+
+
 def hand_value_to_string(value: int) -> str:
     """Convert hand value to human-readable string."""
     # Handle both int32 and uint32 representations

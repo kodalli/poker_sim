@@ -399,12 +399,28 @@ def plot_ppo_training(
         ax.set_ylim(0, 1)
         ax.legend()
         ax.grid(True, alpha=0.3)
-    # Action distribution (stacked area)
-    action_keys = ["poker/action_fold", "poker/action_check", "poker/action_call",
-                   "poker/action_raise", "poker/action_allin"]
-    action_names = ["Fold", "Check", "Call", "Raise", "All-in"]
-    action_colors = ["tab:red", "tab:gray", "tab:blue", "tab:orange", "tab:purple"]
-    if all(k in metrics for k in action_keys):
+    # Action distribution (stacked area) - supports both v2 (5 actions) and v3 (8 actions)
+    # v3: 8 action types with 4 raise sizes
+    v3_action_keys = ["poker/action_fold", "poker/action_check", "poker/action_call",
+                      "poker/action_raise_33", "poker/action_raise_66", "poker/action_raise_100",
+                      "poker/action_raise_150", "poker/action_allin"]
+    v3_action_names = ["Fold", "Check", "Call", "R33%", "R66%", "R100%", "R150%", "All-in"]
+    v3_action_colors = ["tab:red", "tab:gray", "tab:blue", "gold", "tab:orange", "darkorange", "orangered", "tab:purple"]
+    # v2: 5 action types (fallback)
+    v2_action_keys = ["poker/action_fold", "poker/action_check", "poker/action_call",
+                      "poker/action_raise", "poker/action_allin"]
+    v2_action_names = ["Fold", "Check", "Call", "Raise", "All-in"]
+    v2_action_colors = ["tab:red", "tab:gray", "tab:blue", "tab:orange", "tab:purple"]
+
+    # Select v3 or v2 based on available metrics
+    if all(k in metrics for k in v3_action_keys):
+        action_keys, action_names, action_colors = v3_action_keys, v3_action_names, v3_action_colors
+    elif all(k in metrics for k in v2_action_keys):
+        action_keys, action_names, action_colors = v2_action_keys, v2_action_names, v2_action_colors
+    else:
+        action_keys = None
+
+    if action_keys:
         ax = axes[1]
         import numpy as np
         action_data = np.array([metrics[k] for k in action_keys])
@@ -413,7 +429,7 @@ def plot_ppo_training(
         ax.set_ylabel("Action Proportion")
         ax.set_title("Action Distribution")
         ax.set_ylim(0, 1)
-        ax.legend(loc="upper right", fontsize=8)
+        ax.legend(loc="upper right", fontsize=7)
         ax.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(output_dir / "behavior.png", dpi=150, bbox_inches="tight")

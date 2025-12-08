@@ -470,6 +470,84 @@ def train_rl_jax(
     console.print(f"Steps/sec: [cyan]{metrics.steps_per_second:.0f}[/cyan]")
 
 
+@app.command(name="evaluate-jax")
+def evaluate_jax(
+    model: str = typer.Option("v3", "--model", "-m", help="Model version (e.g., v3)"),
+    games: int = typer.Option(10_000, "--games", "-g", help="Number of games per opponent"),
+    opponents: str = typer.Option(
+        "all", "--opponents", "-o",
+        help="Opponent types (comma-separated or 'all'): random,call_station,tag,lag,rock"
+    ),
+    csv: Optional[str] = typer.Option(None, "--csv", help="Export results to CSV"),
+    seed: int = typer.Option(42, "--seed", "-s", help="Random seed"),
+) -> None:
+    """Evaluate JAX-trained model against benchmark opponents.
+
+    Examples:
+        uv run python main.py evaluate-jax --model v3 --games 10000
+        uv run python main.py evaluate-jax -m v3 -g 50000 -o tag,lag --csv results.csv
+    """
+    from evaluation.evaluator import ModelEvaluator, EvalConfig
+    from evaluation.opponents import OPPONENT_TYPES
+
+    console.print("\n[bold blue]JAX Model Evaluation[/bold blue]")
+    console.print("=" * 50)
+
+    # Find model checkpoint
+    model_path = Path(f"models/{model}/final.pkl")
+    if not model_path.exists():
+        # Try alternate paths
+        alt_path = Path(f"models/{model}/checkpoints")
+        if alt_path.exists():
+            checkpoints = list(alt_path.glob("*.pkl"))
+            if checkpoints:
+                model_path = max(checkpoints, key=lambda p: p.stat().st_mtime)
+
+        if not model_path.exists():
+            console.print(f"[red]Model {model} not found![/red]")
+            console.print(f"Looked for: models/{model}/final.pkl")
+            raise typer.Exit(1)
+
+    # Parse opponents
+    if opponents == "all":
+        opponent_list = list(OPPONENT_TYPES.keys())
+    else:
+        opponent_list = [o.strip() for o in opponents.split(",")]
+        for o in opponent_list:
+            if o not in OPPONENT_TYPES:
+                console.print(f"[red]Unknown opponent: {o}[/red]")
+                console.print(f"Available: {list(OPPONENT_TYPES.keys())}")
+                raise typer.Exit(1)
+
+    console.print(f"Model: [cyan]{model}[/cyan]")
+    console.print(f"Games per opponent: [cyan]{games:,}[/cyan]")
+    console.print(f"Opponents: [cyan]{', '.join(opponent_list)}[/cyan]")
+
+    # Create evaluator
+    config = EvalConfig(num_games=games, output_csv=csv)
+    evaluator = ModelEvaluator(
+        model_path=model_path,
+        config=config,
+        seed=seed,
+        console=console,
+    )
+
+    # Run evaluation
+    console.print("\n[bold]Running evaluation...[/bold]\n")
+    import time
+    start = time.time()
+    results = evaluator.evaluate_all(opponent_list)
+    elapsed = time.time() - start
+
+    # Display results
+    console.print(f"\nCompleted in {elapsed:.1f}s\n")
+    evaluator.print_results(results)
+
+    # Export if requested
+    if csv:
+        evaluator.export_csv(results, csv)
+
+
 @app.command()
 def evaluate(
     checkpoint: str = typer.Argument(..., help="Path to checkpoint file"),

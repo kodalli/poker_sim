@@ -11,8 +11,15 @@ wheels/
 
 # Training artifacts
 checkpoints/
-models/*/
-plots/
+*.pkl
+*.pt
+nohup.out
+
+# Model directories - ignore large files, keep plots
+models/*/checkpoints/
+models/*/tensorboard/
+models/*/*.pkl
+models/*/*.pt
 
 # IDE
 .idea/

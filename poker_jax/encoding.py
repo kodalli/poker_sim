@@ -7,10 +7,11 @@ import jax
 import jax.numpy as jnp
 from jax import Array
 
-from poker_jax.state import GameState, ROUND_PREFLOP
+from poker_jax.state import GameState, ROUND_PREFLOP, MAX_HISTORY, NUM_ACTIONS
 from poker_jax.deck import cards_to_one_hot, NUM_CARDS
+from poker_jax.hands import compute_hand_strength_batch
 
-# Observation dimension breakdown:
+# Observation dimension breakdown (v3):
 # - Hole cards: 52 * 2 = 104 (one-hot for each card)
 # - Community cards: 52 * 5 = 260 (one-hot for each card)
 # - Round: 4 (one-hot: preflop, flop, turn, river)
@@ -21,10 +22,15 @@ from poker_jax.deck import cards_to_one_hot, NUM_CARDS
 # - My bet (normalized): 1
 # - Opponent bet (normalized): 1
 # - To call (normalized): 1
-# - Valid actions: 5 (fold, check, call, raise, all_in)
-# Total: 104 + 260 + 4 + 2 + 6 + 5 = 381
+# - Valid actions: 9 (fold, check, call, raise_33, raise_66, raise_100, raise_150, all_in)
+# - Hand strength: 18 (10 category one-hot + 1 strength + 4 draws + 3 texture)
+# - Action history: 30 (10 actions * 3 features each)
+# Total: 104 + 260 + 4 + 2 + 6 + 9 + 18 + 30 = 433
 
-OBS_DIM = 381
+HAND_STRENGTH_DIM = 18
+ACTION_HISTORY_DIM = MAX_HISTORY * 3  # 10 * 3 = 30
+
+OBS_DIM = 433
 
 
 @jax.jit
@@ -91,7 +97,7 @@ def encode_state(state: GameState, player_id: int = 0) -> Array:
     to_call = jnp.maximum(opp_bet - my_bet, 0)
     to_call_norm = jnp.clip(to_call / norm, 0.0, 4.0)[:, None]  # [N, 1]
 
-    # === Valid actions ===
+    # === Valid actions (9 actions in v3) ===
     # Compute valid action mask
     can_fold = jnp.ones(n_games, dtype=jnp.float32)
 
@@ -101,30 +107,58 @@ def encode_state(state: GameState, player_id: int = 0) -> Array:
     # Can call if there's a bet and we have chips
     can_call = ((to_call > 0) & (my_chips >= to_call)).astype(jnp.float32)
 
-    # Can raise if we have more than call amount
+    # Current pot for raise calculations
+    pot = state.pot + state.bets[:, 0] + state.bets[:, 1]
+
+    # Min raise floor
     min_raise_total = opp_bet + state.last_raise_amount
-    can_raise = ((my_chips > to_call) & (my_chips + my_bet >= min_raise_total)).astype(jnp.float32)
+
+    # For each raise size, check if player can afford it (but not be all-in)
+    def can_make_raise(fraction):
+        raise_amount = jnp.maximum(opp_bet + (pot * fraction).astype(jnp.int32), min_raise_total)
+        chips_needed = raise_amount - my_bet
+        return ((my_chips > to_call) & (my_chips >= chips_needed) & (my_chips > chips_needed)).astype(jnp.float32)
+
+    can_raise_33 = can_make_raise(0.33)
+    can_raise_66 = can_make_raise(0.66)
+    can_raise_100 = can_make_raise(1.0)
+    can_raise_150 = can_make_raise(1.5)
 
     # Can always go all-in if we have chips
     can_all_in = (my_chips > 0).astype(jnp.float32)
 
     valid_actions = jnp.stack(
-        [can_fold, can_check, can_call, can_raise, can_all_in], axis=1
-    )  # [N, 5]
+        [can_fold, can_check, can_call, can_raise_33, can_raise_66, can_raise_100, can_raise_150, can_all_in], axis=1
+    )  # [N, 8] - note: index 0 (ACTION_NONE) not included, starts at ACTION_FOLD
+
+    # Pad to NUM_ACTIONS (9) - first element is ACTION_NONE which is always invalid
+    valid_actions_full = jnp.concatenate([
+        jnp.zeros((n_games, 1), dtype=jnp.float32),  # ACTION_NONE = 0
+        valid_actions,  # 8 actions
+    ], axis=1)  # [N, 9]
+
+    # === Hand strength features (18 dims) ===
+    hand_strength = compute_hand_strength_batch(my_hole, state.community)  # [N, 18]
+
+    # === Action history (30 dims) ===
+    # Flatten action history: [N, 10, 3] -> [N, 30]
+    action_history_flat = state.action_history.reshape(n_games, -1)  # [N, 30]
 
     # === Concatenate all features ===
     obs = jnp.concatenate([
-        hole_flat,        # 104
-        community_flat,   # 260
-        round_one_hot,    # 4
-        position,         # 2
-        pot_norm,         # 1
-        my_chips_norm,    # 1
-        opp_chips_norm,   # 1
-        my_bet_norm,      # 1
-        opp_bet_norm,     # 1
-        to_call_norm,     # 1
-        valid_actions,    # 5
+        hole_flat,            # 104
+        community_flat,       # 260
+        round_one_hot,        # 4
+        position,             # 2
+        pot_norm,             # 1
+        my_chips_norm,        # 1
+        opp_chips_norm,       # 1
+        my_bet_norm,          # 1
+        opp_bet_norm,         # 1
+        to_call_norm,         # 1
+        valid_actions_full,   # 9
+        hand_strength,        # 18
+        action_history_flat,  # 30
     ], axis=1)
 
     return obs
@@ -162,10 +196,13 @@ def get_valid_actions_from_obs(obs: Array) -> Array:
         obs: [N, OBS_DIM] observations
 
     Returns:
-        [N, 5] valid action masks
+        [N, NUM_ACTIONS] valid action masks (9 actions)
     """
-    # Valid actions are the last 5 elements
-    return obs[:, -5:]
+    # Valid actions are at position: after chips/bets (377), before hand_strength and action_history
+    # Layout: ... chips/bets (6) | valid_actions (9) | hand_strength (18) | action_history (30)
+    # So valid_actions start at index 377 and go to 386
+    start_idx = 104 + 260 + 4 + 2 + 6  # = 376
+    return obs[:, start_idx:start_idx + NUM_ACTIONS]
 
 
 def describe_observation(obs: Array) -> dict:
@@ -212,10 +249,11 @@ def describe_observation(obs: Array) -> dict:
     to_call = float(obs[idx])
     idx += 1
 
-    # Valid actions
-    valid = obs[idx:idx + 5]
-    action_names = ["fold", "check", "call", "raise", "all_in"]
+    # Valid actions (v3: 9 actions including ACTION_NONE at index 0)
+    valid = obs[idx:idx + NUM_ACTIONS]
+    action_names = ["none", "fold", "check", "call", "raise_33", "raise_66", "raise_100", "raise_150", "all_in"]
     valid_actions = [name for name, v in zip(action_names, valid) if v > 0.5]
+    idx += NUM_ACTIONS
 
     # Decode cards
     def decode_card(one_hot):
