@@ -24,6 +24,19 @@ from poker.table import TableState
 from simulation.runner import GameRunner, SimulationConfig
 from simulation.statistics import StatisticsTracker
 from utils.device import get_device, print_device_info
+from models.manager import (
+    create_metadata,
+    create_version,
+    get_checkpoint_dir,
+    get_final_checkpoint,
+    get_latest_version,
+    get_model_summary,
+    get_next_version,
+    list_models,
+    save_metadata,
+    version_exists,
+    copy_final_checkpoint,
+)
 
 if TYPE_CHECKING:
     from agents.neural.agent import NeuralAgent
@@ -37,19 +50,44 @@ console = Console()
 
 @app.command()
 def train(
+    model: str = typer.Option("v1", "--model", "-m", help="Model version (e.g., v1, v2)"),
     generations: int = typer.Option(100, "--generations", "-g", help="Number of generations"),
     population: int = typer.Option(100, "--population", "-p", help="Population size"),
     architecture: str = typer.Option("mlp", "--arch", "-a", help="Network architecture (mlp, deep_mlp, transformer)"),
     games_per_eval: int = typer.Option(50, "--games", help="Games per fitness evaluation"),
     table_size: int = typer.Option(9, "--table-size", "-t", help="Players per table (2-10)"),
-    checkpoint_dir: str = typer.Option("checkpoints", "--checkpoint-dir", help="Checkpoint directory"),
     resume: Optional[str] = typer.Option(None, "--resume", "-r", help="Resume from checkpoint"),
+    description: str = typer.Option("", "--desc", "-d", help="Model description"),
     seed: Optional[int] = typer.Option(None, "--seed", "-s", help="Random seed"),
     cpu: bool = typer.Option(False, "--cpu", help="Force CPU (disable CUDA)"),
 ) -> None:
     """Train poker AI agents using genetic algorithm evolution."""
     console.print("\n[bold blue]Poker AI Training[/bold blue]")
     console.print("=" * 50)
+
+    # Handle model versioning
+    if version_exists(model):
+        console.print(f"\n[yellow]Model {model} already exists![/yellow]")
+        console.print("Options:")
+        console.print("  1. Overwrite existing model")
+        console.print(f"  2. Create new version ({get_next_version()})")
+        console.print("  3. Cancel")
+
+        choice = typer.prompt("Choose option", default="2")
+
+        if choice == "1":
+            console.print(f"[yellow]Will overwrite {model}[/yellow]")
+        elif choice == "2":
+            model = get_next_version()
+            console.print(f"[green]Creating new version: {model}[/green]")
+        else:
+            console.print("[red]Cancelled.[/red]")
+            raise typer.Exit(0)
+
+    # Create model directory
+    checkpoint_dir = str(get_checkpoint_dir(model))
+    create_version(model, exist_ok=True)
+    console.print(f"Model version: [cyan]{model}[/cyan]")
 
     # Setup device
     device = get_device(prefer_cuda=not cpu)
@@ -112,7 +150,8 @@ def train(
     )
 
     # Setup statistics tracker
-    tracker = StatisticsTracker(output_dir="plots")
+    plots_dir = f"models/{model}/plots"
+    tracker = StatisticsTracker(output_dir=plots_dir)
 
     def callback(eng: EvolutionEngine, gen: int, stats) -> None:
         tracker.add_generation(stats)
@@ -133,6 +172,32 @@ def train(
         console.print("\n[yellow]Training interrupted. Saving checkpoint...[/yellow]")
         engine.save_checkpoint("interrupted.pt")
 
+    # Copy final checkpoint to model directory
+    copy_final_checkpoint(model)
+
+    # Get best fitness
+    best = pop.get_best_individuals(1)[0]
+    best_fitness = best.fitness
+
+    # Save metadata
+    metadata = create_metadata(
+        version=model,
+        architecture=architecture,
+        generations=pop.generation,
+        population_size=population,
+        best_fitness=best_fitness,
+        description=description or f"Trained for {generations} generations",
+        config={
+            "hidden_dims": list(network_config.hidden_dims),
+            "small_blind": fitness_config.small_blind,
+            "big_blind": fitness_config.big_blind,
+            "starting_chips": fitness_config.starting_chips,
+            "games_per_eval": games_per_eval,
+            "table_size": table_size,
+        },
+    )
+    save_metadata(model, metadata)
+
     # Generate plots
     console.print("\nGenerating plots...")
     tracker.plot_all()
@@ -141,8 +206,8 @@ def train(
     tracker.print_summary()
 
     console.print(f"\n[green]Training complete![/green]")
-    console.print(f"Checkpoints saved to: {checkpoint_dir}/")
-    console.print(f"Plots saved to: plots/")
+    console.print(f"Model saved to: models/{model}/")
+    console.print(f"Plots saved to: {plots_dir}/")
 
 
 @app.command()
@@ -260,7 +325,7 @@ class DebugNeuralAgent(BaseAgent):
 
 
 def _run_human_game(
-    checkpoint_path: str,
+    model_version: str,
     max_hands: int,
     cpu: bool,
 ) -> None:
@@ -271,20 +336,25 @@ def _run_human_game(
 
     device = get_device(prefer_cuda=not cpu)
 
-    # Load AI from checkpoint (before entering alternate screen)
-    if not Path(checkpoint_path).exists():
-        console.print(f"[red]Checkpoint not found: {checkpoint_path}[/red]")
-        console.print("[yellow]Run 'uv run python main.py train' first to train an AI.[/yellow]")
+    # Load AI from model version
+    checkpoint_path = get_final_checkpoint(model_version)
+    if not checkpoint_path.exists():
+        console.print(f"[red]Model {model_version} not found![/red]")
+        available = list_models()
+        if available:
+            console.print(f"Available models: {', '.join(available)}")
+        else:
+            console.print("[yellow]Run 'uv run poker-sim train' first to train a model.[/yellow]")
         raise typer.Exit(1)
 
-    console.print(f"Loading AI from: [cyan]{checkpoint_path}[/cyan]")
+    console.print(f"Loading model: [cyan]{model_version}[/cyan]")
     pop = Population(size=1, device=device)
-    pop.load(checkpoint_path)
+    pop.load(str(checkpoint_path))
     best = pop.get_best_individuals(1)[0]
 
     # Create agents
     ai_agent = pop.get_agent(best, temperature=0.3)
-    ai_agent.name = "AI"
+    ai_agent.name = model_version
     debug_ai = DebugNeuralAgent(ai_agent, console)
 
     human_agent = HumanAgent(name="You", console=console)
@@ -411,19 +481,26 @@ def _run_human_game(
 
 @app.command()
 def play(
-    checkpoint: Optional[str] = typer.Option(None, "--checkpoint", "-c", help="Load trained agent"),
+    model: Optional[str] = typer.Option(None, "--model", "-m", help="Model version (default: latest)"),
     num_players: int = typer.Option(6, "--players", "-p", help="Number of players (2-10)"),
     hands: int = typer.Option(10, "--hands", "-n", help="Number of hands to play"),
     cpu: bool = typer.Option(False, "--cpu", help="Force CPU"),
     human: bool = typer.Option(False, "--human", "-H", help="Play as human against AI"),
 ) -> None:
     """Play poker - watch AI or play as human."""
+    # Default to latest model
+    if model is None:
+        model = get_latest_version()
+        if model is None:
+            console.print("[red]No models found![/red]")
+            console.print("[yellow]Run 'uv run poker-sim train' first to train a model.[/yellow]")
+            raise typer.Exit(1)
+
     if human:
         # Human vs AI mode
-        checkpoint_path = checkpoint or "checkpoints/final.pt"
         console.print("\n[bold blue]Human vs AI Poker[/bold blue]")
         console.print("=" * 50)
-        _run_human_game(checkpoint_path, hands, cpu)
+        _run_human_game(model, hands, cpu)
         return
 
     # Watch mode (existing behavior)
@@ -432,26 +509,28 @@ def play(
 
     device = get_device(prefer_cuda=not cpu)
 
-    # Create agents
-    agents = []
-    if checkpoint:
-        pop = Population(size=1, device=device)
-        pop.load(checkpoint)
-        best = pop.get_best_individuals(1)[0]
-        agents.append(pop.get_agent(best, temperature=0.5))
-        agents[0].name = "Neural_AI"
+    # Load model
+    checkpoint_path = get_final_checkpoint(model)
+    if not checkpoint_path.exists():
+        console.print(f"[red]Model {model} not found![/red]")
+        raise typer.Exit(1)
 
-        # Fill rest with opponents
-        for i in range(num_players - 1):
-            if i % 2 == 0:
-                agents.append(TightAggressiveAgent(name=f"TAG_{i+1}"))
-            else:
-                agents.append(RandomAgent(name=f"Random_{i+1}"))
-    else:
-        # All random agents
-        agents = [RandomAgent(name=f"Random_{i}") for i in range(num_players)]
+    pop = Population(size=1, device=device)
+    pop.load(str(checkpoint_path))
+    best = pop.get_best_individuals(1)[0]
+
+    agents = [pop.get_agent(best, temperature=0.5)]
+    agents[0].name = model
+
+    # Fill rest with opponents
+    for i in range(num_players - 1):
+        if i % 2 == 0:
+            agents.append(TightAggressiveAgent(name=f"TAG_{i+1}"))
+        else:
+            agents.append(RandomAgent(name=f"Random_{i+1}"))
 
     # Run game
+    console.print(f"Model: [cyan]{model}[/cyan]")
     console.print(f"Playing {hands} hands with {num_players} players...\n")
 
     runner = GameRunner(SimulationConfig(max_hands_per_game=hands))
@@ -537,6 +616,143 @@ def benchmark(
     console.print(f"Average hands per game: {results['avg_hands_per_game']:.1f}")
 
 
+@app.command(name="models")
+def list_models_cmd() -> None:
+    """List all available model versions."""
+    console.print("\n[bold blue]Available Models[/bold blue]")
+    console.print("=" * 50)
+
+    versions = list_models()
+    if not versions:
+        console.print("[yellow]No models found.[/yellow]")
+        console.print("Run 'uv run poker-sim train' to train a model.")
+        return
+
+    table = Table()
+    table.add_column("Version", style="cyan")
+    table.add_column("Architecture", style="white")
+    table.add_column("Generations", style="white")
+    table.add_column("Best Fitness", style="green")
+    table.add_column("Created", style="dim")
+    table.add_column("Description", style="white")
+
+    for version in versions:
+        summary = get_model_summary(version)
+        table.add_row(
+            summary["version"],
+            str(summary["architecture"]),
+            str(summary["generations"]),
+            f"{summary['best_fitness']:.2f}" if isinstance(summary["best_fitness"], float) else str(summary["best_fitness"]),
+            summary["created"][:10] if summary["created"] != "unknown" else "?",
+            summary["description"][:30] + "..." if len(summary.get("description", "")) > 30 else summary.get("description", ""),
+        )
+
+    console.print(table)
+    console.print(f"\nTotal: {len(versions)} model(s)")
+
+
+@app.command()
+def tournament(
+    model_versions: list[str] = typer.Argument(..., help="Model versions to compete (e.g., v1 v2 v3)"),
+    games: int = typer.Option(100, "--games", "-g", help="Games per matchup"),
+    mode: str = typer.Option("round-robin", "--mode", help="Tournament mode: 'matchup' (1v1) or 'round-robin'"),
+    cpu: bool = typer.Option(False, "--cpu", help="Force CPU"),
+) -> None:
+    """Run a tournament between model versions."""
+    from simulation.tournament import run_matchup, run_tournament as run_tourney
+
+    console.print("\n[bold blue]Model Tournament[/bold blue]")
+    console.print("=" * 50)
+
+    # Validate models exist
+    for v in model_versions:
+        if not version_exists(v):
+            console.print(f"[red]Model {v} not found![/red]")
+            available = list_models()
+            if available:
+                console.print(f"Available models: {', '.join(available)}")
+            raise typer.Exit(1)
+
+    device = torch.device("cpu") if cpu else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    console.print(f"Device: [green]{device}[/green]")
+
+    if mode == "matchup" and len(model_versions) == 2:
+        # Simple 1v1 matchup
+        m1, m2 = model_versions
+        console.print(f"\n[bold]Matchup: {m1} vs {m2}[/bold]")
+        console.print(f"Playing {games} games...\n")
+
+        result = run_matchup(m1, m2, games, device)
+
+        # Display results
+        table = Table(title="Matchup Results")
+        table.add_column("Model", style="cyan")
+        table.add_column("Wins", style="green")
+        table.add_column("Win Rate", style="white")
+        table.add_column("Avg Chips", style="white")
+
+        table.add_row(
+            m1,
+            str(result.model1_wins),
+            f"{result.model1_win_rate:.1%}",
+            f"{result.model1_avg_chips:+.1f}",
+        )
+        table.add_row(
+            m2,
+            str(result.model2_wins),
+            f"{result.model2_win_rate:.1%}",
+            f"{result.model2_avg_chips:+.1f}",
+        )
+
+        console.print(table)
+
+        if result.model1_wins > result.model2_wins:
+            console.print(f"\n[bold green]Winner: {m1}[/bold green]")
+        elif result.model2_wins > result.model1_wins:
+            console.print(f"\n[bold green]Winner: {m2}[/bold green]")
+        else:
+            console.print("\n[bold yellow]Draw![/bold yellow]")
+
+    else:
+        # Round-robin tournament
+        console.print(f"\n[bold]Round-Robin Tournament[/bold]")
+        console.print(f"Models: {', '.join(model_versions)}")
+        console.print(f"Games per matchup: {games}\n")
+
+        result = run_tourney(model_versions, games, device)
+
+        # Display leaderboard
+        table = Table(title="Tournament Leaderboard")
+        table.add_column("Rank", style="bold")
+        table.add_column("Model", style="cyan")
+        table.add_column("W", style="green")
+        table.add_column("L", style="red")
+        table.add_column("D", style="yellow")
+        table.add_column("Win Rate", style="white")
+        table.add_column("Total Chips", style="white")
+        table.add_column("Avg Chips", style="white")
+
+        leaderboard = result.get_leaderboard()
+        for rank, (model, stats) in enumerate(leaderboard, 1):
+            table.add_row(
+                str(rank),
+                model,
+                str(stats["wins"]),
+                str(stats["losses"]),
+                str(stats["draws"]),
+                f"{stats['win_rate']:.1%}",
+                f"{stats['total_chips']:+,}",
+                f"{stats['avg_chips']:+.1f}",
+            )
+
+        console.print(table)
+
+        # Show champion
+        if leaderboard:
+            champion = leaderboard[0][0]
+            console.print(f"\n[bold green]Champion: {champion}[/bold green]")
+
+
 def main() -> None:
     """Entry point."""
     app()
@@ -544,10 +760,17 @@ def main() -> None:
 
 def play_human() -> None:
     """Entry point for human vs AI play mode."""
+    # Get latest model
+    model = get_latest_version()
+    if model is None:
+        console.print("[red]No models found![/red]")
+        console.print("[yellow]Run 'uv run poker-sim train' first to train a model.[/yellow]")
+        raise typer.Exit(1)
+
     console.print("\n[bold blue]Human vs AI Poker[/bold blue]")
     console.print("=" * 50)
     _run_human_game(
-        checkpoint_path="checkpoints/final.pt",
+        model_version=model,
         max_hands=50,
         cpu=False,
     )
