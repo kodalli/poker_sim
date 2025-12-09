@@ -44,6 +44,7 @@ class Trajectory(NamedTuple):
     rewards: Array  # [T, N]
     dones: Array  # [T, N]
     valid_masks: Array  # [T, N, num_actions]
+    model_masks: Array | None = None  # [T, N] - 1.0 when model acted, 0.0 on opponent turns (optional for backward compat)
 
 
 class PPOMetrics(NamedTuple):
@@ -137,6 +138,7 @@ def ppo_loss(
     valid_masks: Array,
     config: PPOConfig,
     rng_key: Array,
+    model_masks: Array | None = None,
 ) -> tuple[Array, dict]:
     """Compute PPO loss.
 
@@ -151,6 +153,7 @@ def ppo_loss(
         valid_masks: [batch, num_actions] valid action masks
         config: PPO config
         rng_key: PRNG key for dropout
+        model_masks: [batch] mask (1.0 = model's turn, 0.0 = opponent's turn). If None, all steps are used.
 
     Returns:
         Tuple of (total_loss, metrics_dict)
@@ -176,16 +179,30 @@ def ppo_loss(
     probs = jax.nn.softmax(masked_logits, axis=-1)
     # Add epsilon to avoid log(0) for invalid actions (their probs are ~0 but not exactly 0)
     safe_log_probs = jnp.log(probs + 1e-10)
-    entropy = -jnp.sum(probs * safe_log_probs, axis=-1).mean()
+    per_sample_entropy = -jnp.sum(probs * safe_log_probs, axis=-1)
 
-    # PPO policy loss
+    # PPO policy loss (per sample)
     ratio = jnp.exp(new_log_probs - old_log_probs)
     surr1 = ratio * advantages
     surr2 = jnp.clip(ratio, 1 - config.epsilon, 1 + config.epsilon) * advantages
-    policy_loss = -jnp.minimum(surr1, surr2).mean()
+    per_sample_policy_loss = -jnp.minimum(surr1, surr2)
 
-    # Value loss
-    value_loss = ((values - returns) ** 2).mean()
+    # Value loss (per sample)
+    per_sample_value_loss = (values - returns) ** 2
+
+    # Apply model_masks if provided (only backprop on model's turns)
+    if model_masks is not None:
+        # Masked mean for policy loss and entropy (only train on model's decisions)
+        mask_sum = jnp.maximum(model_masks.sum(), 1.0)  # Avoid div by 0
+        policy_loss = (per_sample_policy_loss * model_masks).sum() / mask_sum
+        entropy = (per_sample_entropy * model_masks).sum() / mask_sum
+        # Value loss can use all samples (value function learns from all observations)
+        value_loss = per_sample_value_loss.mean()
+    else:
+        # No masking - use all samples (backward compat for self-play)
+        policy_loss = per_sample_policy_loss.mean()
+        entropy = per_sample_entropy.mean()
+        value_loss = per_sample_value_loss.mean()
 
     # Entropy bonus (negative because we want to maximize entropy)
     entropy_loss = -entropy
@@ -240,6 +257,7 @@ def ppo_update_step(
     valid_masks: Array,
     config: PPOConfig,
     rng_key: Array,
+    model_masks: Array | None = None,
 ) -> tuple[dict, optax.OptState, dict]:
     """Single PPO update step.
 
@@ -250,7 +268,7 @@ def ppo_update_step(
     grad_fn = jax.value_and_grad(ppo_loss, argnums=1, has_aux=True)
     (loss, metrics), grads = grad_fn(
         network, params, obs, actions, old_log_probs,
-        advantages, returns, valid_masks, config, rng_key
+        advantages, returns, valid_masks, config, rng_key, model_masks
     )
 
     # Compute gradient norm before clipping
@@ -264,7 +282,7 @@ def ppo_update_step(
     return new_params, new_opt_state, metrics
 
 
-def _create_ppo_epoch_fn(network, optimizer, config):
+def _create_ppo_epoch_fn(network, optimizer, config, use_model_masks=False):
     """Create JIT-compiled epoch function for PPO updates.
 
     This is separated to allow JIT compilation with static arguments.
@@ -275,7 +293,11 @@ def _create_ppo_epoch_fn(network, optimizer, config):
     def single_epoch(carry, _):
         """Process one epoch of minibatch updates."""
         params, opt_state, metrics_sum, rng_key, data = carry
-        obs_flat, actions_flat, log_probs_flat, advantages_flat, returns_flat, valid_masks_flat = data
+        if use_model_masks:
+            obs_flat, actions_flat, log_probs_flat, advantages_flat, returns_flat, valid_masks_flat, model_masks_flat = data
+        else:
+            obs_flat, actions_flat, log_probs_flat, advantages_flat, returns_flat, valid_masks_flat = data
+            model_masks_flat = None
 
         batch_size = obs_flat.shape[0]
         minibatch_size = batch_size // num_minibatches
@@ -299,6 +321,7 @@ def _create_ppo_epoch_fn(network, optimizer, config):
             mb_advantages = advantages_flat[mb_indices]
             mb_returns = returns_flat[mb_indices]
             mb_valid_masks = valid_masks_flat[mb_indices]
+            mb_model_masks = model_masks_flat[mb_indices] if model_masks_flat is not None else None
 
             # Update
             rng_key, update_key = jax.random.split(rng_key)
@@ -306,7 +329,7 @@ def _create_ppo_epoch_fn(network, optimizer, config):
                 network, params, opt_state, optimizer,
                 mb_obs, mb_actions, mb_log_probs,
                 mb_advantages, mb_returns, mb_valid_masks,
-                config, update_key
+                config, update_key, mb_model_masks
             )
 
             # Accumulate metrics (keep as JAX arrays, no float() conversion!)
@@ -379,7 +402,13 @@ def ppo_update(
     returns_flat = returns.reshape(-1)
     valid_masks_flat = trajectory.valid_masks.reshape(-1, trajectory.valid_masks.shape[-1])
 
-    data = (obs_flat, actions_flat, log_probs_flat, advantages_flat, returns_flat, valid_masks_flat)
+    # Handle model_masks (optional, for mixed opponent training)
+    use_model_masks = trajectory.model_masks is not None
+    if use_model_masks:
+        model_masks_flat = trajectory.model_masks.reshape(-1)
+        data = (obs_flat, actions_flat, log_probs_flat, advantages_flat, returns_flat, valid_masks_flat, model_masks_flat)
+    else:
+        data = (obs_flat, actions_flat, log_probs_flat, advantages_flat, returns_flat, valid_masks_flat)
 
     # Initialize metrics accumulator (JAX arrays)
     init_metrics = {
@@ -394,10 +423,10 @@ def ppo_update(
         "value_pred_error": jnp.array(0.0),
     }
 
-    # Get or create cached epoch function
-    cache_key = (id(network), id(optimizer), config.num_minibatches)
+    # Get or create cached epoch function (separate cache for with/without model_masks)
+    cache_key = (id(network), id(optimizer), config.num_minibatches, use_model_masks)
     if cache_key not in _epoch_fn_cache:
-        _epoch_fn_cache[cache_key] = _create_ppo_epoch_fn(network, optimizer, config)
+        _epoch_fn_cache[cache_key] = _create_ppo_epoch_fn(network, optimizer, config, use_model_masks)
     epoch_fn = _epoch_fn_cache[cache_key]
 
     # Run all epochs using scan (fully on GPU)

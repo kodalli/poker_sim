@@ -496,12 +496,7 @@ class JAXTrainer:
         obs = encode_state_for_current_player(state)  # [N, obs_dim]
 
         # Get valid actions
-        valid_mask = get_valid_actions_from_obs(obs)  # [N, 5]
-        # Pad to 6 actions (index 0 is unused)
-        valid_mask_full = jnp.concatenate([
-            jnp.zeros((n_games, 1)),  # Index 0 unused
-            valid_mask,
-        ], axis=1)
+        valid_mask = get_valid_actions_from_obs(obs)  # [N, 9] (includes ACTION_NONE at index 0)
 
         # Forward pass
         action_logits, bet_frac, values = network.apply(
@@ -657,6 +652,7 @@ class JAXTrainer:
         all_rewards = []
         all_dones = []
         all_valid_masks = []
+        all_model_masks = []  # v3.6: Track which steps are model's turns (for mixed opponent training)
 
         total_rewards = 0.0
         games_completed = 0
@@ -723,9 +719,10 @@ class JAXTrainer:
                 new_state, obs, actions, log_probs, values, rewards, dones, valid_mask, model_mask = \
                     self._collect_step_mixed(self.network, self.params, state, opponent_types, step_key, historical_params, use_different_historical)
             else:
-                # Self-play mode: both players use network
+                # Self-play mode: both players use network (all turns are "model" turns)
                 new_state, obs, actions, log_probs, values, rewards, dones, valid_mask = \
                     self._collect_step(self.network, self.params, state, step_key)
+                model_mask = jnp.ones(n_games, dtype=jnp.float32)  # All turns count in self-play
 
             # Store
             all_obs.append(obs)
@@ -735,6 +732,7 @@ class JAXTrainer:
             all_rewards.append(rewards)
             all_dones.append(dones)
             all_valid_masks.append(valid_mask)
+            all_model_masks.append(model_mask)  # v3.6: Store model turn mask
 
             # Track metrics
             completed = dones.sum()
@@ -801,7 +799,8 @@ class JAXTrainer:
             values=jnp.stack(all_values),  # [T, N]
             rewards=jnp.stack(all_rewards),  # [T, N]
             dones=jnp.stack(all_dones),  # [T, N]
-            valid_masks=jnp.stack(all_valid_masks),  # [T, N, 5]
+            valid_masks=jnp.stack(all_valid_masks),  # [T, N, 9]
+            model_masks=jnp.stack(all_model_masks),  # [T, N] - v3.6: 1.0 when model acted, 0.0 on opponent turns
         )
 
         # Compute metrics
