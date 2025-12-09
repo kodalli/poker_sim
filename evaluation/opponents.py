@@ -411,6 +411,63 @@ def trapper_opponent(
     return actions
 
 
+# ========== VALUE BETTOR (Exploits Never-Fold) ==========
+@jax.jit
+def value_bettor_opponent(
+    state: GameState,
+    valid_mask: Array,
+    rng_key: Array,
+    obs: Array,
+) -> Array:
+    """Value Bettor opponent - only bets with premium hands.
+
+    Strategy:
+    - Premium hands (>0.85): Bet/raise big (value betting)
+    - Everything else: Check/fold (never bluff)
+
+    This exploits "never fold" strategies:
+    - When this opponent bets, they ALWAYS have a strong hand
+    - Calling their bets with weak hands = guaranteed loss
+    - Model must learn: "when value_bettor bets, fold weak hands"
+    """
+    n_games = state.done.shape[0]
+    game_idx = jnp.arange(n_games)
+    player_idx = state.current_player
+
+    hole_cards = state.hole_cards[game_idx, player_idx, :]
+    preflop_strength = _compute_preflop_strength(hole_cards)
+
+    postflop_strength = obs[:, NORMALIZED_STRENGTH_IDX]
+
+    is_preflop = state.round == ROUND_PREFLOP
+    strength = jnp.where(is_preflop, preflop_strength, postflop_strength)
+
+    # Value bettor thresholds - very tight
+    premium = strength > 0.85  # Only top ~15% of hands
+
+    can_check = valid_mask[:, ACTION_CHECK]
+    can_call = valid_mask[:, ACTION_CALL]
+    can_raise_100 = valid_mask[:, ACTION_RAISE_100]
+    can_raise_150 = valid_mask[:, ACTION_RAISE_150]
+    can_all_in = valid_mask[:, ACTION_ALL_IN]
+
+    # Premium: bet big for value (we have the goods)
+    premium_action = jnp.where(
+        can_raise_150, ACTION_RAISE_150,
+        jnp.where(can_raise_100, ACTION_RAISE_100,
+        jnp.where(can_all_in, ACTION_ALL_IN,
+        jnp.where(can_call, ACTION_CALL,
+        jnp.where(can_check, ACTION_CHECK, ACTION_FOLD))))
+    )
+
+    # Non-premium: never bluff - check if free, fold to any bet
+    passive_action = jnp.where(can_check, ACTION_CHECK, ACTION_FOLD)
+
+    actions = jnp.where(premium, premium_action, passive_action)
+
+    return actions
+
+
 # ========== OPPONENT REGISTRY ==========
 OPPONENT_TYPES = {
     "random": random_opponent,
@@ -419,7 +476,8 @@ OPPONENT_TYPES = {
     "lag": lag_opponent,
     "rock": rock_opponent,
     "trapper": trapper_opponent,
+    "value_bettor": value_bettor_opponent,
 }
 
 # Opponents that need obs parameter
-NEEDS_OBS = {"tag", "lag", "rock", "trapper"}
+NEEDS_OBS = {"tag", "lag", "rock", "trapper", "value_bettor"}

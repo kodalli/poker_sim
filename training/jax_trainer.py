@@ -36,6 +36,7 @@ from evaluation.opponents import (
     lag_opponent,
     rock_opponent,
     trapper_opponent,
+    value_bettor_opponent,
     NEEDS_OBS,
 )
 from poker_jax.network import (
@@ -110,6 +111,34 @@ class JAXTrainingConfig:
         "random": 0.05,         # 5% random
     })
 
+    # Dynamic opponent scheduling (v3.4) - curriculum learning
+    # Shifts from exploitative opponents early to self-play late
+    use_dynamic_opponent_schedule: bool = True
+    opponent_schedule: list = field(default_factory=lambda: [
+        # (step, mix_dict) - linearly interpolate between milestones
+        # v3.5: Added value_bettor (only bets with premium hands) to force fold learning
+        (0, {
+            "self": 0.15, "historical": 0.10, "trapper": 0.20,
+            "value_bettor": 0.20,  # Forces folding - only bets with premium hands
+            "call_station": 0.15, "tag": 0.10, "rock": 0.05, "random": 0.05,
+        }),
+        (100_000_000, {  # 100M: Start increasing self-play
+            "self": 0.25, "historical": 0.20, "trapper": 0.15,
+            "value_bettor": 0.15,
+            "call_station": 0.10, "tag": 0.07, "rock": 0.05, "random": 0.03,
+        }),
+        (300_000_000, {  # 300M: Heavy self-play
+            "self": 0.40, "historical": 0.30, "trapper": 0.10,
+            "value_bettor": 0.10,
+            "call_station": 0.05, "tag": 0.03, "rock": 0.02, "random": 0.00,
+        }),
+        (600_000_000, {  # 600M+: Mostly self-play for refinement
+            "self": 0.50, "historical": 0.40, "trapper": 0.05,
+            "value_bettor": 0.05,
+            "call_station": 0.00, "tag": 0.00, "rock": 0.00, "random": 0.00,
+        }),
+    ])
+
 
 # Opponent type indices for mixed training
 OPP_SELF = 0
@@ -120,6 +149,62 @@ OPP_TAG = 4
 OPP_LAG = 5
 OPP_ROCK = 6
 OPP_TRAPPER = 7  # v3.3: Anti-aggro trapper
+OPP_VALUE_BETTOR = 8  # v3.5: Only bets with premium hands (exploits never-fold)
+
+
+def interpolate_opponent_mix(
+    current_step: int,
+    schedule: list[tuple[int, dict]],
+) -> dict:
+    """Interpolate opponent mix based on training progress.
+
+    Args:
+        current_step: Current training step
+        schedule: List of (step, mix_dict) tuples defining milestones
+
+    Returns:
+        Interpolated mix dictionary for current step
+    """
+    if not schedule:
+        return {}
+
+    # Sort schedule by step
+    schedule = sorted(schedule, key=lambda x: x[0])
+
+    # Find surrounding milestones
+    prev_step, prev_mix = schedule[0]
+    next_step, next_mix = schedule[-1]
+
+    for i, (step, mix) in enumerate(schedule):
+        if step <= current_step:
+            prev_step, prev_mix = step, mix
+        if step > current_step:
+            next_step, next_mix = step, mix
+            break
+
+    # If past last milestone, use final mix
+    if current_step >= schedule[-1][0]:
+        return schedule[-1][1].copy()
+
+    # If before first milestone, use first mix
+    if current_step <= schedule[0][0]:
+        return schedule[0][1].copy()
+
+    # Linear interpolation
+    if next_step == prev_step:
+        alpha = 0.0
+    else:
+        alpha = (current_step - prev_step) / (next_step - prev_step)
+
+    # Interpolate each key
+    all_keys = set(prev_mix.keys()) | set(next_mix.keys())
+    result = {}
+    for key in all_keys:
+        prev_val = prev_mix.get(key, 0.0)
+        next_val = next_mix.get(key, 0.0)
+        result[key] = prev_val + alpha * (next_val - prev_val)
+
+    return result
 
 
 def sample_opponent_types(
@@ -137,7 +222,7 @@ def sample_opponent_types(
     Returns:
         [N] array of opponent type indices (0=self, 1=historical, 2=random, etc.)
     """
-    # Build probability array in order: self, historical, random, call_station, tag, lag, rock, trapper
+    # Build probability array in order: self, historical, random, call_station, tag, lag, rock, trapper, value_bettor
     probs = jnp.array([
         opponent_mix.get("self", 0.0),
         opponent_mix.get("historical", 0.0),  # v3.2
@@ -147,13 +232,14 @@ def sample_opponent_types(
         opponent_mix.get("lag", 0.0),
         opponent_mix.get("rock", 0.0),  # v3.3
         opponent_mix.get("trapper", 0.0),  # v3.3: anti-aggro
+        opponent_mix.get("value_bettor", 0.0),  # v3.5: exploits never-fold
     ])
     # Normalize
     probs = probs / probs.sum()
 
     # Sample using categorical
     logits = jnp.log(probs + 1e-10)  # Avoid log(0)
-    logits = jnp.broadcast_to(logits, (n_games, 8))  # 8 opponent types
+    logits = jnp.broadcast_to(logits, (n_games, 9))  # 9 opponent types (v3.5)
     opponent_types = jax.random.categorical(rng_key, logits)
 
     return opponent_types
@@ -189,9 +275,9 @@ def get_mixed_opponent_actions(
     """
     n_games = state.done.shape[0]
 
-    # Split RNG for each opponent type (8 types in v3.3)
-    keys = jrandom.split(rng_key, 8)
-    key_self, key_hist, key_random, key_call, key_tag, key_lag, key_rock, key_trapper = keys
+    # Split RNG for each opponent type (9 types in v3.5)
+    keys = jrandom.split(rng_key, 9)
+    key_self, key_hist, key_random, key_call, key_tag, key_lag, key_rock, key_trapper, key_value = keys
 
     # Compute actions for each opponent type
     # Self: use network with current params
@@ -227,8 +313,11 @@ def get_mixed_opponent_actions(
     # Trapper (needs obs) - v3.3: anti-aggro opponent
     trapper_actions = trapper_opponent(state, valid_mask, key_trapper, obs)
 
+    # Value bettor (needs obs) - v3.5: only bets with premium hands (exploits never-fold)
+    value_actions = value_bettor_opponent(state, valid_mask, key_value, obs)
+
     # Select based on opponent type
-    # opponent_types: 0=self, 1=historical, 2=random, 3=call_station, 4=tag, 5=lag, 6=rock, 7=trapper
+    # opponent_types: 0=self, 1=historical, 2=random, 3=call_station, 4=tag, 5=lag, 6=rock, 7=trapper, 8=value_bettor
     actions = jnp.where(
         opponent_types == OPP_SELF, self_actions,
         jnp.where(
@@ -243,7 +332,10 @@ def get_mixed_opponent_actions(
                             opponent_types == OPP_LAG, lag_actions,
                             jnp.where(
                                 opponent_types == OPP_ROCK, rock_actions,
-                                trapper_actions  # Default to trapper
+                                jnp.where(
+                                    opponent_types == OPP_TRAPPER, trapper_actions,
+                                    value_actions  # Default to value_bettor
+                                )
                             )
                         )
                     )
@@ -372,8 +464,16 @@ class JAXTrainer:
                 max_size=self.training_config.historical_pool_size
             )
             self.console.print(f"[bold cyan]Historical Self-Play (v3.2)[/bold cyan]")
-            mix = self.training_config.historical_opponent_mix
-            self.console.print(f"  Opponent mix: {', '.join(f'{k}={v:.0%}' for k,v in mix.items())}")
+
+            # Dynamic scheduling info (v3.4)
+            if self.training_config.use_dynamic_opponent_schedule and self.training_config.opponent_schedule:
+                self.console.print(f"  [bold yellow]Dynamic Opponent Scheduling (v3.4)[/bold yellow]")
+                for step, mix in self.training_config.opponent_schedule:
+                    self.console.print(f"    @{step/1e6:.0f}M: self={mix.get('self',0):.0%}, hist={mix.get('historical',0):.0%}, trap={mix.get('trapper',0):.0%}")
+            else:
+                mix = self.training_config.historical_opponent_mix
+                self.console.print(f"  Opponent mix: {', '.join(f'{k}={v:.0%}' for k,v in mix.items())}")
+
             self.console.print(f"  Pool size: {self.training_config.historical_pool_size}")
             self.console.print(f"  Save every: {self.training_config.historical_save_every:,} steps")
 
@@ -528,11 +628,13 @@ class JAXTrainer:
     def collect_rollout(
         self,
         num_steps: int,
+        current_step: int = 0,
     ) -> tuple[Trajectory, TrainingMetrics]:
         """Collect rollout data from parallel games.
 
         Args:
             num_steps: Number of steps to collect
+            current_step: Current global training step (for dynamic opponent scheduling)
 
         Returns:
             Tuple of (trajectory, metrics)
@@ -590,9 +692,16 @@ class JAXTrainer:
         use_different_historical = False  # Static flag: True when using actual historical checkpoint
 
         if use_historical:
-            # Historical self-play mode (v3.2)
+            # Historical self-play mode (v3.2) with optional dynamic scheduling (v3.4)
             self.rng_key, opp_key = jrandom.split(self.rng_key)
-            opponent_types = sample_opponent_types(opp_key, n_games, config.historical_opponent_mix)
+
+            # Get opponent mix (dynamic or static)
+            if config.use_dynamic_opponent_schedule and config.opponent_schedule:
+                opp_mix = interpolate_opponent_mix(current_step, config.opponent_schedule)
+            else:
+                opp_mix = config.historical_opponent_mix
+
+            opponent_types = sample_opponent_types(opp_key, n_games, opp_mix)
 
             # Sample historical opponent if pool has checkpoints
             if self.checkpoint_pool and self.checkpoint_pool.has_checkpoints():
@@ -602,7 +711,8 @@ class JAXTrainer:
         elif use_mixed:
             # Mixed opponent mode (v3.1)
             self.rng_key, opp_key = jrandom.split(self.rng_key)
-            opponent_types = sample_opponent_types(opp_key, n_games, config.opponent_mix)
+            opp_mix = config.opponent_mix  # Static mix for non-historical mode
+            opponent_types = sample_opponent_types(opp_key, n_games, opp_mix)
 
         for step_idx in range(num_steps):
             # Collect step
@@ -675,7 +785,7 @@ class JAXTrainer:
                 # Resample opponent types for reset games (mixed/historical mode)
                 if use_mixed:
                     self.rng_key, opp_key = jrandom.split(self.rng_key)
-                    opp_mix = config.historical_opponent_mix if use_historical else config.opponent_mix
+                    # Use same opp_mix as initial (already computed with dynamic scheduling)
                     new_opp_types = sample_opponent_types(opp_key, n_games, opp_mix)
                     opponent_types = jnp.where(new_state.done, new_opp_types, opponent_types)
             else:
@@ -747,9 +857,9 @@ class JAXTrainer:
 
         try:
             for update_idx in iterator:
-                # Collect rollout
+                # Collect rollout (pass current step for dynamic opponent scheduling)
                 steps_per_game = config.steps_per_update // config.num_parallel_games
-                trajectory, collect_metrics = self.collect_rollout(steps_per_game)
+                trajectory, collect_metrics = self.collect_rollout(steps_per_game, current_step=global_step)
 
                 global_step += collect_metrics.steps
                 total_games += collect_metrics.games_completed

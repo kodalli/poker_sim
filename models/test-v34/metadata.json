@@ -1,0 +1,18 @@
+{
+  "version": "test-v34",
+  "architecture": "actor_critic_jax",
+  "generations": 1627,
+  "population_size": 1536,
+  "best_fitness": 0.0,
+  "created": "2025-12-08T22:52:10.454449",
+  "description": "v3.4 test with dynamic opponent scheduling",
+  "config": {
+    "learning_rate": 0.0003,
+    "total_steps": 5000000,
+    "parallel_games": 1536,
+    "training_method": "ppo_jax",
+    "steps_per_second": 91166.17518158286,
+    "mixed_opponents": false,
+    "historical_selfplay": true
+  }
+}
