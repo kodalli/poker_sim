@@ -1,0 +1,18 @@
+{
+  "version": "test-v32-opt",
+  "architecture": "actor_critic_jax",
+  "generations": 162,
+  "population_size": 1536,
+  "best_fitness": 0.0,
+  "created": "2025-12-08T20:55:27.209153",
+  "description": "Testing v3.2 optimizations",
+  "config": {
+    "learning_rate": 0.0003,
+    "total_steps": 500000,
+    "parallel_games": 1536,
+    "training_method": "ppo_jax",
+    "steps_per_second": 24804.554444674846,
+    "mixed_opponents": false,
+    "historical_selfplay": true
+  }
+}

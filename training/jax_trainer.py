@@ -151,7 +151,7 @@ def sample_opponent_types(
     return opponent_types
 
 
-@partial(jax.jit, static_argnums=(5,))
+@partial(jax.jit, static_argnums=(5, 8))
 def get_mixed_opponent_actions(
     state: GameState,
     valid_mask: Array,
@@ -160,7 +160,8 @@ def get_mixed_opponent_actions(
     rng_key: Array,
     network: "ActorCriticMLP",
     params: dict,
-    historical_params: dict | None = None,
+    historical_params: dict,
+    use_historical: bool = False,
 ) -> Array:
     """Get actions for mixed opponents based on assigned types.
 
@@ -172,7 +173,8 @@ def get_mixed_opponent_actions(
         rng_key: PRNG key
         network: Network for self-play
         params: Network params for self-play
-        historical_params: Params from historical checkpoint (optional, for v3.2)
+        historical_params: Params from historical checkpoint (always a valid dict)
+        use_historical: Static flag - if True, compute separate forward pass for historical
 
     Returns:
         [N] action indices
@@ -189,11 +191,15 @@ def get_mixed_opponent_actions(
     self_actions, _ = sample_action(key_self, action_logits, valid_mask)
     self_actions = self_actions + 1  # Convert to game actions (1-indexed)
 
-    # Historical: use network with historical params (or current if not provided)
-    hist_params = historical_params if historical_params is not None else params
-    hist_logits, _, _ = network.apply({"params": hist_params}, obs, training=False)
-    hist_actions, _ = sample_action(key_hist, hist_logits, valid_mask)
-    hist_actions = hist_actions + 1
+    # Historical: only compute separate forward pass if we have actual historical params
+    # This is a static branch - JAX will trace two versions (use_historical=True/False)
+    if use_historical:
+        hist_logits, _, _ = network.apply({"params": historical_params}, obs, training=False)
+        hist_actions, _ = sample_action(key_hist, hist_logits, valid_mask)
+        hist_actions = hist_actions + 1
+    else:
+        # No historical checkpoint yet - reuse self actions (saves one forward pass)
+        hist_actions = self_actions
 
     # Random opponent
     random_actions = random_opponent(state, valid_mask, key_random)
@@ -411,18 +417,28 @@ class JAXTrainer:
         return new_state, obs, actions, log_probs, values, player_rewards, dones, valid_mask
 
     @staticmethod
-    @partial(jax.jit, static_argnums=(0,))
+    @partial(jax.jit, static_argnums=(0, 6))
     def _collect_step_mixed(
         network: ActorCriticMLP,
         params: dict,
         state: GameState,
         opponent_types: Array,
         rng_key: Array,
-        historical_params: dict | None = None,
+        historical_params: dict,
+        use_historical: bool = False,
     ) -> tuple[GameState, Array, Array, Array, Array, Array, Array, Array, Array]:
         """Collect one step with mixed opponents (JIT-compiled).
 
         Model is always player 0. Opponents are player 1.
+
+        Args:
+            network: Network architecture (static)
+            params: Current model params
+            state: Game state
+            opponent_types: Opponent type per game
+            rng_key: PRNG key
+            historical_params: Historical checkpoint params (always a valid dict)
+            use_historical: Static flag - if True, use separate historical forward pass
 
         Returns:
             Tuple of (new_state, obs, actions, log_probs, values, rewards, dones, valid_mask, model_turn_mask)
@@ -451,7 +467,7 @@ class JAXTrainer:
         # Opponents expect this format (already in correct format)
         opponent_actions = get_mixed_opponent_actions(
             state, valid_mask, obs, opponent_types,
-            opp_key, network, params, historical_params
+            opp_key, network, params, historical_params, use_historical
         )
 
         # Select action based on whose turn
@@ -548,8 +564,10 @@ class JAXTrainer:
         use_mixed = config.use_mixed_opponents or use_historical
 
         # Setup opponent types and historical params
-        historical_params = None
+        # Always pass valid params dict to maintain pytree structure (prevents JAX retracing)
+        historical_params = self.params  # Default to current params
         historical_elo = INITIAL_ELO
+        use_different_historical = False  # Static flag: True when using actual historical checkpoint
 
         if use_historical:
             # Historical self-play mode (v3.2)
@@ -560,6 +578,7 @@ class JAXTrainer:
             if self.checkpoint_pool and self.checkpoint_pool.has_checkpoints():
                 self.rng_key, hist_key = jrandom.split(self.rng_key)
                 historical_params, _, historical_elo = self.checkpoint_pool.sample_opponent(hist_key)
+                use_different_historical = True  # Now using actual historical checkpoint
         elif use_mixed:
             # Mixed opponent mode (v3.1)
             self.rng_key, opp_key = jrandom.split(self.rng_key)
@@ -572,7 +591,7 @@ class JAXTrainer:
             if use_mixed:
                 # Mixed/historical opponent mode: model is player 0, opponents are player 1
                 new_state, obs, actions, log_probs, values, rewards, dones, valid_mask, model_mask = \
-                    self._collect_step_mixed(self.network, self.params, state, opponent_types, step_key, historical_params)
+                    self._collect_step_mixed(self.network, self.params, state, opponent_types, step_key, historical_params, use_different_historical)
             else:
                 # Self-play mode: both players use network
                 new_state, obs, actions, log_probs, values, rewards, dones, valid_mask = \

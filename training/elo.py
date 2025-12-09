@@ -1,9 +1,9 @@
 """ELO rating system and checkpoint pool for historical self-play."""
 
-import copy
 from dataclasses import dataclass, field
 from typing import Optional
 
+import jax
 import jax.numpy as jnp
 import jax.random as jrandom
 from jax import Array
@@ -80,12 +80,13 @@ class CheckpointPool:
         """Add a new checkpoint to the pool.
 
         Args:
-            params: Model parameters (will be deep copied)
+            params: Model parameters (will be copied)
             step: Training step when checkpoint was saved
         """
-        # Deep copy params to avoid mutation
+        # JAX-optimized copy (faster than copy.deepcopy for pytrees)
+        copied_params = jax.tree_util.tree_map(lambda x: x.copy(), params)
         checkpoint = HistoricalCheckpoint(
-            params=copy.deepcopy(params),
+            params=copied_params,
             elo=self.current_elo,  # New checkpoint inherits current ELO
             step=step,
         )
