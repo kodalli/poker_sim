@@ -345,6 +345,8 @@ def train_rl_jax(
     ppo_epochs: int = typer.Option(4, "--ppo-epochs", help="PPO epochs per update"),
     # Mixed opponent training (v3.1)
     mixed_opponents: bool = typer.Option(False, "--mixed-opponents", help="Train against mixed opponents (50%% self, 15%% random, 15%% call_station, 10%% TAG, 10%% LAG)"),
+    # Historical self-play (v3.2)
+    historical_selfplay: bool = typer.Option(False, "--historical-selfplay", help="Train with historical self-play and ELO tracking (40%% self, 40%% historical, 10%% call_station, 5%% random, 5%% TAG)"),
 ) -> None:
     """Train poker AI using JAX-accelerated PPO (GPU-optimized)."""
     try:
@@ -418,6 +420,7 @@ def train_rl_jax(
         checkpoint_dir=checkpoint_dir,
         tensorboard_dir=tensorboard,
         use_mixed_opponents=mixed_opponents,
+        use_historical_selfplay=historical_selfplay,
     )
 
     # Create trainer
@@ -456,6 +459,7 @@ def train_rl_jax(
             "training_method": "ppo_jax",
             "steps_per_second": metrics.steps_per_second,
             "mixed_opponents": mixed_opponents,
+            "historical_selfplay": historical_selfplay,
         },
     )
     save_metadata(model, metadata)

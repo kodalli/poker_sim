@@ -52,6 +52,7 @@ from training.jax_ppo import (
     ppo_update,
 )
 from training.logging import MetricsLogger
+from training.elo import CheckpointPool, OPPONENT_ELOS, INITIAL_ELO
 
 
 @dataclass
@@ -93,13 +94,26 @@ class JAXTrainingConfig:
         "lag": 0.10,        # 10% loose-aggressive
     })
 
+    # Historical self-play (v3.2)
+    use_historical_selfplay: bool = False
+    historical_pool_size: int = 20
+    historical_save_every: int = 50_000_000  # Save checkpoint every 50M steps
+    historical_opponent_mix: dict = field(default_factory=lambda: {
+        "self": 0.40,           # 40% current self-play
+        "historical": 0.40,     # 40% historical checkpoints
+        "call_station": 0.10,   # 10% call station
+        "random": 0.05,         # 5% random
+        "tag": 0.05,            # 5% TAG
+    })
+
 
 # Opponent type indices for mixed training
 OPP_SELF = 0
-OPP_RANDOM = 1
-OPP_CALL_STATION = 2
-OPP_TAG = 3
-OPP_LAG = 4
+OPP_HISTORICAL = 1  # v3.2: Historical self-play
+OPP_RANDOM = 2
+OPP_CALL_STATION = 3
+OPP_TAG = 4
+OPP_LAG = 5
 
 
 def sample_opponent_types(
@@ -115,11 +129,12 @@ def sample_opponent_types(
         opponent_mix: Dict mapping opponent name to probability
 
     Returns:
-        [N] array of opponent type indices (0=self, 1=random, etc.)
+        [N] array of opponent type indices (0=self, 1=historical, 2=random, etc.)
     """
-    # Build probability array in order: self, random, call_station, tag, lag
+    # Build probability array in order: self, historical, random, call_station, tag, lag
     probs = jnp.array([
         opponent_mix.get("self", 0.0),
+        opponent_mix.get("historical", 0.0),  # v3.2
         opponent_mix.get("random", 0.0),
         opponent_mix.get("call_station", 0.0),
         opponent_mix.get("tag", 0.0),
@@ -130,7 +145,7 @@ def sample_opponent_types(
 
     # Sample using categorical
     logits = jnp.log(probs + 1e-10)  # Avoid log(0)
-    logits = jnp.broadcast_to(logits, (n_games, 5))
+    logits = jnp.broadcast_to(logits, (n_games, 6))  # 6 opponent types
     opponent_types = jax.random.categorical(rng_key, logits)
 
     return opponent_types
@@ -145,6 +160,7 @@ def get_mixed_opponent_actions(
     rng_key: Array,
     network: "ActorCriticMLP",
     params: dict,
+    historical_params: dict | None = None,
 ) -> Array:
     """Get actions for mixed opponents based on assigned types.
 
@@ -156,6 +172,7 @@ def get_mixed_opponent_actions(
         rng_key: PRNG key
         network: Network for self-play
         params: Network params for self-play
+        historical_params: Params from historical checkpoint (optional, for v3.2)
 
     Returns:
         [N] action indices
@@ -163,14 +180,20 @@ def get_mixed_opponent_actions(
     n_games = state.done.shape[0]
 
     # Split RNG for each opponent type
-    keys = jrandom.split(rng_key, 5)
-    key_self, key_random, key_call, key_tag, key_lag = keys
+    keys = jrandom.split(rng_key, 6)
+    key_self, key_hist, key_random, key_call, key_tag, key_lag = keys
 
     # Compute actions for each opponent type
-    # Self: use network
+    # Self: use network with current params
     action_logits, _, _ = network.apply({"params": params}, obs, training=False)
     self_actions, _ = sample_action(key_self, action_logits, valid_mask)
     self_actions = self_actions + 1  # Convert to game actions (1-indexed)
+
+    # Historical: use network with historical params (or current if not provided)
+    hist_params = historical_params if historical_params is not None else params
+    hist_logits, _, _ = network.apply({"params": hist_params}, obs, training=False)
+    hist_actions, _ = sample_action(key_hist, hist_logits, valid_mask)
+    hist_actions = hist_actions + 1
 
     # Random opponent
     random_actions = random_opponent(state, valid_mask, key_random)
@@ -185,16 +208,19 @@ def get_mixed_opponent_actions(
     lag_actions = lag_opponent(state, valid_mask, key_lag, obs)
 
     # Select based on opponent type
-    # opponent_types: 0=self, 1=random, 2=call_station, 3=tag, 4=lag
+    # opponent_types: 0=self, 1=historical, 2=random, 3=call_station, 4=tag, 5=lag
     actions = jnp.where(
         opponent_types == OPP_SELF, self_actions,
         jnp.where(
-            opponent_types == OPP_RANDOM, random_actions,
+            opponent_types == OPP_HISTORICAL, hist_actions,
             jnp.where(
-                opponent_types == OPP_CALL_STATION, call_actions,
+                opponent_types == OPP_RANDOM, random_actions,
                 jnp.where(
-                    opponent_types == OPP_TAG, tag_actions,
-                    lag_actions  # Default to LAG
+                    opponent_types == OPP_CALL_STATION, call_actions,
+                    jnp.where(
+                        opponent_types == OPP_TAG, tag_actions,
+                        lag_actions  # Default to LAG
+                    )
                 )
             )
         )
@@ -313,6 +339,18 @@ class JAXTrainer:
             mix = self.training_config.opponent_mix
             self.console.print(f"  Opponent mix: {', '.join(f'{k}={v:.0%}' for k,v in mix.items())}")
 
+        # Historical self-play (v3.2)
+        self.checkpoint_pool: CheckpointPool | None = None
+        if self.training_config.use_historical_selfplay:
+            self.checkpoint_pool = CheckpointPool(
+                max_size=self.training_config.historical_pool_size
+            )
+            self.console.print(f"[bold cyan]Historical Self-Play (v3.2)[/bold cyan]")
+            mix = self.training_config.historical_opponent_mix
+            self.console.print(f"  Opponent mix: {', '.join(f'{k}={v:.0%}' for k,v in mix.items())}")
+            self.console.print(f"  Pool size: {self.training_config.historical_pool_size}")
+            self.console.print(f"  Save every: {self.training_config.historical_save_every:,} steps")
+
     @staticmethod
     @partial(jax.jit, static_argnums=(0,))
     def _collect_step(
@@ -380,6 +418,7 @@ class JAXTrainer:
         state: GameState,
         opponent_types: Array,
         rng_key: Array,
+        historical_params: dict | None = None,
     ) -> tuple[GameState, Array, Array, Array, Array, Array, Array, Array, Array]:
         """Collect one step with mixed opponents (JIT-compiled).
 
@@ -412,7 +451,7 @@ class JAXTrainer:
         # Opponents expect this format (already in correct format)
         opponent_actions = get_mixed_opponent_actions(
             state, valid_mask, obs, opponent_types,
-            opp_key, network, params
+            opp_key, network, params, historical_params
         )
 
         # Select action based on whose turn
@@ -504,9 +543,25 @@ class JAXTrainer:
 
         start_time = time.time()
 
-        # Mixed opponent mode setup
-        use_mixed = config.use_mixed_opponents
-        if use_mixed:
+        # Determine training mode
+        use_historical = config.use_historical_selfplay
+        use_mixed = config.use_mixed_opponents or use_historical
+
+        # Setup opponent types and historical params
+        historical_params = None
+        historical_elo = INITIAL_ELO
+
+        if use_historical:
+            # Historical self-play mode (v3.2)
+            self.rng_key, opp_key = jrandom.split(self.rng_key)
+            opponent_types = sample_opponent_types(opp_key, n_games, config.historical_opponent_mix)
+
+            # Sample historical opponent if pool has checkpoints
+            if self.checkpoint_pool and self.checkpoint_pool.has_checkpoints():
+                self.rng_key, hist_key = jrandom.split(self.rng_key)
+                historical_params, _, historical_elo = self.checkpoint_pool.sample_opponent(hist_key)
+        elif use_mixed:
+            # Mixed opponent mode (v3.1)
             self.rng_key, opp_key = jrandom.split(self.rng_key)
             opponent_types = sample_opponent_types(opp_key, n_games, config.opponent_mix)
 
@@ -515,9 +570,9 @@ class JAXTrainer:
             self.rng_key, step_key = jrandom.split(self.rng_key)
 
             if use_mixed:
-                # Mixed opponent mode: model is player 0, opponents are player 1
+                # Mixed/historical opponent mode: model is player 0, opponents are player 1
                 new_state, obs, actions, log_probs, values, rewards, dones, valid_mask, model_mask = \
-                    self._collect_step_mixed(self.network, self.params, state, opponent_types, step_key)
+                    self._collect_step_mixed(self.network, self.params, state, opponent_types, step_key, historical_params)
             else:
                 # Self-play mode: both players use network
                 new_state, obs, actions, log_probs, values, rewards, dones, valid_mask = \
@@ -578,10 +633,11 @@ class JAXTrainer:
 
                 state = jax.tree_util.tree_map(select_state, fresh_state, new_state)
 
-                # Resample opponent types for reset games (mixed mode)
+                # Resample opponent types for reset games (mixed/historical mode)
                 if use_mixed:
                     self.rng_key, opp_key = jrandom.split(self.rng_key)
-                    new_opp_types = sample_opponent_types(opp_key, n_games, config.opponent_mix)
+                    opp_mix = config.historical_opponent_mix if use_historical else config.opponent_mix
+                    new_opp_types = sample_opponent_types(opp_key, n_games, opp_mix)
                     opponent_types = jnp.where(new_state.done, new_opp_types, opponent_types)
             else:
                 state = new_state
@@ -671,6 +727,35 @@ class JAXTrainer:
                     update_key,
                 )
 
+                # Historical self-play: update checkpoint pool and ELO
+                if config.use_historical_selfplay and self.checkpoint_pool:
+                    # Add checkpoint to pool periodically
+                    if global_step > 0 and global_step % config.historical_save_every < config.steps_per_update:
+                        self.checkpoint_pool.add_checkpoint(self.params, global_step)
+                        if self.file_logger:
+                            pool_stats = self.checkpoint_pool.get_pool_stats()
+                            self.file_logger.info(
+                                f"  [POOL] Added checkpoint at step {global_step:,} | "
+                                f"Pool size: {pool_stats['pool_size']} | "
+                                f"ELO range: {pool_stats['min_elo']:.0f}-{pool_stats['max_elo']:.0f}"
+                            )
+
+                    # Update ELO based on game outcomes (simplified: use win rate vs expected)
+                    # Record wins/losses for ELO update
+                    decided_games = collect_metrics.wins + collect_metrics.losses
+                    if decided_games > 0:
+                        # Assume ~40% of games are vs historical opponents
+                        hist_games = int(decided_games * config.historical_opponent_mix.get("historical", 0.4))
+                        hist_wins = int(collect_metrics.wins * config.historical_opponent_mix.get("historical", 0.4))
+                        for _ in range(hist_wins):
+                            self.checkpoint_pool.record_game_result(True, self.checkpoint_pool.current_elo)
+                        for _ in range(hist_games - hist_wins):
+                            self.checkpoint_pool.record_game_result(False, self.checkpoint_pool.current_elo)
+
+                    # Batch update ELO every 1000 updates
+                    if (update_idx + 1) % 1000 == 0:
+                        self.checkpoint_pool.update_elo_batch()
+
                 # Logging - only update progress bar every 100 updates to reduce terminal I/O
                 if show_progress and (update_idx + 1) % 100 == 0:
                     iterator.set_postfix(
@@ -728,15 +813,31 @@ class JAXTrainer:
                         "poker/action_allin": ac["all_in"] / max(total_actions, 1),
                     })
 
+                    # Add ELO metrics for historical self-play (v3.2)
+                    if config.use_historical_selfplay and self.checkpoint_pool:
+                        pool_stats = self.checkpoint_pool.get_pool_stats()
+                        self.logger.log(global_step, {
+                            "elo/current": self.checkpoint_pool.current_elo,
+                            "elo/gain": self.checkpoint_pool.current_elo - INITIAL_ELO,
+                            "elo/pool_size": pool_stats["pool_size"],
+                            "elo/pool_avg": pool_stats["avg_elo"],
+                        })
+
                 # File logging (persist progress for long runs) - reduced frequency
                 if self.file_logger and update_idx % 1000 == 0:
                     decided_games = collect_metrics.wins + collect_metrics.losses
                     win_rate = collect_metrics.wins / max(decided_games, 1)
                     total_actions = sum(collect_metrics.action_counts.values())
+
+                    # Add ELO to log line if historical self-play
+                    elo_str = ""
+                    if config.use_historical_selfplay and self.checkpoint_pool:
+                        elo_str = f" | elo={self.checkpoint_pool.current_elo:>6.0f}"
+
                     self.file_logger.info(
                         f"step={global_step:>8} | rew={collect_metrics.avg_reward:>7.3f} | "
                         f"win={win_rate:>5.1%} | pol={ppo_metrics.policy_loss:>7.4f} | "
-                        f"ev={ppo_metrics.explained_variance:>5.2f} | sps={collect_metrics.steps_per_second:>5.0f}"
+                        f"ev={ppo_metrics.explained_variance:>5.2f} | sps={collect_metrics.steps_per_second:>5.0f}{elo_str}"
                     )
                     # Debug: action breakdown and game outcomes (v3: 8 action types)
                     ac = collect_metrics.action_counts

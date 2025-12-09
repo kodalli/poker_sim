@@ -13,7 +13,7 @@ wheels/
 checkpoints/
 *.pkl
 *.pt
-nohup.out
+*.out
 
 # Model directories - ignore large files, keep plots
 models/*/checkpoints/
