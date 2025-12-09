@@ -271,7 +271,7 @@ def train_rl(
         epsilon=0.2,
         ppo_epochs=4,
         batch_size=64,
-        entropy_coef=0.01,
+        entropy_coef=0.05,  # v3.3: Higher entropy for action diversity
         value_coef=0.5,
     )
 
@@ -399,7 +399,7 @@ def train_rl_jax(
         epsilon=0.2,
         ppo_epochs=ppo_epochs,
         num_minibatches=minibatches,
-        entropy_coef=0.01,
+        entropy_coef=0.05,  # v3.3: Higher entropy for action diversity
         value_coef=0.5,
     )
 

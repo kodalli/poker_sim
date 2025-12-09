@@ -1,0 +1,18 @@
+{
+  "version": "test-v33b",
+  "architecture": "actor_critic_jax",
+  "generations": 3255,
+  "population_size": 1536,
+  "best_fitness": 0.0,
+  "created": "2025-12-08T22:23:55.849729",
+  "description": "v3.3 test with higher entropy (0.05) and punishing trapper",
+  "config": {
+    "learning_rate": 0.0003,
+    "total_steps": 10000000,
+    "parallel_games": 1536,
+    "training_method": "ppo_jax",
+    "steps_per_second": 124036.83954411389,
+    "mixed_opponents": false,
+    "historical_selfplay": true
+  }
+}

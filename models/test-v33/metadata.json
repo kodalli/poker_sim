@@ -1,0 +1,18 @@
+{
+  "version": "test-v33",
+  "architecture": "actor_critic_jax",
+  "generations": 162,
+  "population_size": 1536,
+  "best_fitness": 0.0,
+  "created": "2025-12-08T22:15:39.271649",
+  "description": "Test v3.3 anti-exploitation",
+  "config": {
+    "learning_rate": 0.0003,
+    "total_steps": 500000,
+    "parallel_games": 1536,
+    "training_method": "ppo_jax",
+    "steps_per_second": 23984.944030464423,
+    "mixed_opponents": false,
+    "historical_selfplay": true
+  }
+}

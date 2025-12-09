@@ -338,6 +338,79 @@ def rock_opponent(
     return actions
 
 
+# ========== TRAPPER (Anti-Aggro) ==========
+@jax.jit
+def trapper_opponent(
+    state: GameState,
+    valid_mask: Array,
+    rng_key: Array,
+    obs: Array,
+) -> Array:
+    """Trapper opponent - exploits hyper-aggressive players.
+
+    Strategy:
+    - Strong hands (>0.70): RE-RAISE to punish aggro (they bet, we raise back)
+    - Medium hands (0.45-0.70): Call to see showdown
+    - Weak hands (<0.45): Fold to save chips
+
+    This punishes "always bet" strategies by:
+    - Forcing them to pay more when we have strong hands
+    - Making them fold or lose big pots to our re-raises
+    """
+    n_games = state.done.shape[0]
+    game_idx = jnp.arange(n_games)
+    player_idx = state.current_player
+
+    hole_cards = state.hole_cards[game_idx, player_idx, :]
+    preflop_strength = _compute_preflop_strength(hole_cards)
+
+    postflop_strength = obs[:, NORMALIZED_STRENGTH_IDX]
+
+    is_preflop = state.round == ROUND_PREFLOP
+    strength = jnp.where(is_preflop, preflop_strength, postflop_strength)
+
+    # Add small noise
+    rng_key, noise_key = jrandom.split(rng_key)
+    noise = jrandom.normal(noise_key, (n_games,)) * 0.05
+    strength = jnp.clip(strength + noise, 0.0, 1.0)
+
+    # Trapper thresholds
+    strong = strength > 0.70
+    medium = (strength > 0.45) & ~strong
+
+    can_check = valid_mask[:, ACTION_CHECK]
+    can_call = valid_mask[:, ACTION_CALL]
+    can_raise_100 = valid_mask[:, ACTION_RAISE_100]
+    can_raise_150 = valid_mask[:, ACTION_RAISE_150]
+    can_all_in = valid_mask[:, ACTION_ALL_IN]
+
+    # Strong: RE-RAISE to punish aggro players (raise back when they bet)
+    # If they raised, we re-raise. If it's checked to us, we bet.
+    strong_action = jnp.where(
+        can_raise_150, ACTION_RAISE_150,  # Big re-raise
+        jnp.where(can_raise_100, ACTION_RAISE_100,
+        jnp.where(can_all_in, ACTION_ALL_IN,
+        jnp.where(can_call, ACTION_CALL,
+        jnp.where(can_check, ACTION_CHECK, ACTION_FOLD))))
+    )
+
+    # Medium: call to see showdown (check if free)
+    medium_action = jnp.where(
+        can_check, ACTION_CHECK,
+        jnp.where(can_call, ACTION_CALL, ACTION_FOLD)
+    )
+
+    # Weak: fold to any aggression, check if free
+    weak_action = jnp.where(can_check, ACTION_CHECK, ACTION_FOLD)
+
+    actions = jnp.where(
+        strong, strong_action,
+        jnp.where(medium, medium_action, weak_action)
+    )
+
+    return actions
+
+
 # ========== OPPONENT REGISTRY ==========
 OPPONENT_TYPES = {
     "random": random_opponent,
@@ -345,7 +418,8 @@ OPPONENT_TYPES = {
     "tag": tag_opponent,
     "lag": lag_opponent,
     "rock": rock_opponent,
+    "trapper": trapper_opponent,
 }
 
 # Opponents that need obs parameter
-NEEDS_OBS = {"tag", "lag", "rock"}
+NEEDS_OBS = {"tag", "lag", "rock", "trapper"}

@@ -508,3 +508,318 @@ Step | FOLD  CHECK  CALL  RAISE  ALL_IN | Bet
   7  | 0.02  0.05   0.50  0.40   0.03  | 0.30   # Nearly decided
   8  | 0.01  0.04   0.55  0.38   0.02  | 0.28   # Final: CALL
 ```
+
+---
+
+# TRM + PPO: Reinforcement Learning Approach
+
+## Motivation
+
+The original TRM paper uses **supervised learning** with labeled data. However, this has limitations for poker:
+
+1. **Labeled data constrains learning**: Model can only imitate existing play
+2. **No novel strategies**: Can't discover strategies beyond training data
+3. **Data generation overhead**: Need to create/curate labeled datasets
+
+**Our insight**: TRM's iterative refinement is analogous to **tree search in latent space**:
+
+```
+MCTS/CFR:  Explicitly explores decision tree → Better strategy
+TRM:       Implicitly refines in latent space → Better decision
+
+Both use multiple "passes" to improve decisions.
+```
+
+## TRM + PPO Architecture
+
+Replace supervised learning with PPO (Proximal Policy Optimization):
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     TRM + PPO Architecture                  │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  Input: obs (433 dims)                                      │
+│           │                                                 │
+│           ▼                                                 │
+│  ┌─────────────────┐                                        │
+│  │ Input Projection │  Linear(433→128) + LayerNorm + ReLU   │
+│  └─────────────────┘                                        │
+│           │                                                 │
+│     ┌─────┴─────┐                                           │
+│     │           │                                           │
+│     ▼           ▼                                           │
+│   y_0=0       z_0=0                                         │
+│     │           │                                           │
+│     └─────┬─────┘                                           │
+│           │                                                 │
+│     ╔═════╧═════╗                                           │
+│     ║ K steps   ║  ←── Iterative refinement (K=8)           │
+│     ║ of refine ║      Each step: z = update(x, y, z)       │
+│     ╚═════╤═════╝               y = refine(z, y)            │
+│           │                                                 │
+│     ┌─────┴─────┐                                           │
+│     │           │                                           │
+│     ▼           ▼                                           │
+│  ┌──────┐   ┌──────┐                                        │
+│  │Policy│   │Value │  ←── Two heads for actor-critic        │
+│  │ Head │   │ Head │                                        │
+│  └──────┘   └──────┘                                        │
+│     │           │                                           │
+│     ▼           ▼                                           │
+│  action     value                                           │
+│  logits    estimate                                         │
+│     │           │                                           │
+│     └─────┬─────┘                                           │
+│           │                                                 │
+│           ▼                                                 │
+│     PPO Loss (no labels needed!)                            │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Key Differences from Supervised TRM
+
+| Aspect | Supervised TRM | TRM + PPO |
+|--------|----------------|-----------|
+| Training signal | Labeled (state, action) pairs | Rewards from environment |
+| Data source | Pre-generated dataset | Online self-play |
+| Novel strategies | Limited to training data | Can emerge through exploration |
+| Value estimation | Not needed | Critic head required |
+| Loss function | Cross-entropy on labels | PPO surrogate objective |
+
+### JAX/Flax Implementation
+
+```python
+class TRMActorCritic(nn.Module):
+    """TRM with actor-critic heads for PPO training."""
+
+    proj_dim: int = 128
+    latent_dim: int = 64
+    answer_dim: int = 9      # 9 actions in v3
+    num_steps: int = 8       # K recursion steps
+    dropout_rate: float = 0.1
+
+    @nn.compact
+    def __call__(self, x: Array, training: bool = True) -> tuple[Array, Array]:
+        """Forward pass returning policy logits and value.
+
+        Args:
+            x: [batch, 433] observations
+
+        Returns:
+            action_logits: [batch, 9] policy logits
+            value: [batch, 1] state value estimate
+        """
+        batch_size = x.shape[0]
+
+        # Input projection
+        x_proj = nn.Dense(self.proj_dim)(x)
+        x_proj = nn.LayerNorm()(x_proj)
+        x_proj = nn.relu(x_proj)
+
+        # Initialize y (answer) and z (latent reasoning state)
+        y = jnp.zeros((batch_size, self.answer_dim))
+        z = jnp.zeros((batch_size, self.latent_dim))
+
+        # Shared updaters (parameters reused across steps)
+        latent_updater = LatentUpdater(
+            self.proj_dim, self.answer_dim, self.latent_dim, self.dropout_rate
+        )
+        answer_updater = AnswerUpdater(self.latent_dim, self.answer_dim)
+
+        # Iterative refinement
+        for k in range(self.num_steps):
+            z = latent_updater(x_proj, y, z, training)
+            y = answer_updater(z, y)
+
+        # Policy head: action logits from final y
+        action_logits = y  # y is already [batch, 9]
+
+        # Value head: from final latent state z
+        value_hidden = nn.Dense(64)(z)
+        value_hidden = nn.relu(value_hidden)
+        value = nn.Dense(1)(value_hidden)
+
+        return action_logits, value
+
+
+class LatentUpdater(nn.Module):
+    """Updates reasoning state z."""
+    proj_dim: int
+    answer_dim: int
+    latent_dim: int
+    dropout_rate: float
+
+    @nn.compact
+    def __call__(self, x_proj, y, z, training):
+        combined = jnp.concatenate([x_proj, y, z], axis=-1)
+        h = nn.Dense(self.proj_dim)(combined)
+        h = nn.gelu(h)
+        h = nn.Dropout(self.dropout_rate, deterministic=not training)(h)
+        h = nn.Dense(self.latent_dim)(h)
+        h = nn.LayerNorm()(h)
+        return z + h  # Residual connection
+
+
+class AnswerUpdater(nn.Module):
+    """Updates answer y from latent z."""
+    latent_dim: int
+    answer_dim: int
+
+    @nn.compact
+    def __call__(self, z, y_prev):
+        h = nn.Dense(32)(z)
+        h = nn.gelu(h)
+        h = nn.Dense(self.answer_dim)(h)
+        return y_prev + h  # Residual connection
+```
+
+## Connection to Game Theory
+
+### TRM as Implicit Tree Search
+
+Traditional poker AI uses explicit tree search (CFR, MCTS):
+
+```
+CFR/MCTS:
+                    [Current State]
+                    /      |      \
+                 Fold    Call    Raise
+                  /        |        \
+            [eval]    [recurse]   [recurse]
+                         ...        ...
+
+Explicit tree: O(actions^depth) nodes
+```
+
+TRM does something analogous in **latent space**:
+
+```
+TRM Refinement:
+Step 1: z₁ encodes "what are my options?"
+Step 2: z₂ encodes "what if I fold? call? raise?"
+Step 3: z₃ encodes "how might opponent respond?"
+Step 4: z₄ encodes "what's my expected value?"
+...
+Step K: z_K has "searched" the decision space
+
+Implicit search: O(K) forward passes, fixed compute
+```
+
+The key insight: **TRM learns WHAT to reason about**, while CFR/MCTS have hand-crafted search procedures.
+
+### Emergent Multi-Step Reasoning
+
+With PPO training, TRM can learn:
+
+| Step | What Model Might Learn |
+|------|------------------------|
+| 1-2 | Hand strength evaluation |
+| 3-4 | Position and pot odds |
+| 5-6 | Opponent modeling (what would they do?) |
+| 7-8 | Counterfactual reasoning (what if I...?) |
+
+This is **not prescribed** - it emerges from optimizing reward.
+
+## Integration with Anti-Exploitation
+
+TRM + PPO naturally combines with anti-exploitation features (see `docs/anti-exploitation.md`):
+
+```python
+# TRM training config with anti-exploitation
+trm_training_config = {
+    # TRM architecture
+    "num_steps": 8,
+    "latent_dim": 64,
+    "proj_dim": 128,
+
+    # PPO settings
+    "learning_rate": 3e-4,
+    "entropy_coef": 0.05,  # Higher entropy for exploration
+
+    # Anti-exploitation opponent mix
+    "opponent_mix": {
+        "self": 0.30,
+        "historical": 0.25,
+        "trapper": 0.15,
+        "call_station": 0.10,
+        "tag": 0.08,
+        "rock": 0.07,
+        "random": 0.05,
+    },
+}
+```
+
+## Expected Benefits
+
+### vs Supervised TRM
+
+1. **Novel strategies**: Not limited to imitation
+2. **No labeling**: Train directly from self-play
+3. **Continuous improvement**: Can exceed any teacher
+
+### vs MLP + PPO (Current v3)
+
+1. **Explicit reasoning steps**: Interpretable decision process
+2. **Smaller model**: 50K params vs 160K
+3. **Adaptive compute**: More passes for hard decisions (future)
+4. **Better generalization**: Reasoning transfers across situations
+
+## Implementation Plan
+
+### Phase 1: TRM Network in JAX
+
+1. Create `poker_jax/trm_network.py`
+   - `TRMActorCritic` class
+   - `LatentUpdater`, `AnswerUpdater` modules
+
+2. Add to network factory
+   - `create_network("trm")` option
+
+### Phase 2: Training Integration
+
+1. Modify `training/jax_trainer.py`
+   - Support TRM network in `_collect_step_mixed`
+   - No changes to PPO (same loss function!)
+
+2. Add CLI option
+   - `--architecture trm` flag
+
+### Phase 3: Evaluation & Comparison
+
+1. Train TRM with same opponent mix as v3.3
+2. Compare metrics:
+   - Win rate vs all opponents
+   - Action diversity (entropy)
+   - Training speed (steps/sec)
+   - Interpretability (step-by-step visualization)
+
+## Training Command (v4)
+
+```bash
+nohup uv run python main.py train-rl-jax \
+  --model v4 \
+  --architecture trm \
+  --steps 1000000000 \
+  --parallel 1536 \
+  --historical-selfplay \
+  --entropy-coef 0.05 \
+  --tensorboard logs/v4 \
+  --desc "TRM with PPO and anti-exploitation" \
+  > nohup_v4.out 2>&1 &
+```
+
+## Open Questions
+
+1. **Optimal K**: How many refinement steps? 8? 16? Adaptive?
+2. **Latent supervision**: Should we add auxiliary losses on intermediate z?
+3. **Opponent embedding**: Feed opponent type into TRM for adaptive play?
+4. **Compute vs params**: Is 8 passes of 50K better than 1 pass of 160K?
+
+## References
+
+- [TRM Paper](https://arxiv.org/abs/2510.04871): "Less is More: Recursive Reasoning with Tiny Networks"
+- [TRM Code](https://github.com/SamsungSAILMontreal/TinyRecursiveModels)
+- [PPO Paper](https://arxiv.org/abs/1707.06347): "Proximal Policy Optimization Algorithms"
+- [MuZero](https://arxiv.org/abs/1911.08265): Learned model for planning (related concept)

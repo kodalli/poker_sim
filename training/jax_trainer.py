@@ -34,6 +34,8 @@ from evaluation.opponents import (
     call_station_opponent,
     tag_opponent,
     lag_opponent,
+    rock_opponent,
+    trapper_opponent,
     NEEDS_OBS,
 )
 from poker_jax.network import (
@@ -94,16 +96,18 @@ class JAXTrainingConfig:
         "lag": 0.10,        # 10% loose-aggressive
     })
 
-    # Historical self-play (v3.2)
+    # Historical self-play (v3.2) with anti-exploitation (v3.3)
     use_historical_selfplay: bool = False
     historical_pool_size: int = 20
     historical_save_every: int = 50_000_000  # Save checkpoint every 50M steps
     historical_opponent_mix: dict = field(default_factory=lambda: {
-        "self": 0.40,           # 40% current self-play
-        "historical": 0.40,     # 40% historical checkpoints
+        "self": 0.30,           # 30% current self-play
+        "historical": 0.25,     # 25% historical checkpoints
+        "trapper": 0.15,        # 15% trapper (anti-aggro) - v3.3
         "call_station": 0.10,   # 10% call station
+        "tag": 0.08,            # 8% TAG
+        "rock": 0.07,           # 7% rock (very tight) - v3.3
         "random": 0.05,         # 5% random
-        "tag": 0.05,            # 5% TAG
     })
 
 
@@ -114,6 +118,8 @@ OPP_RANDOM = 2
 OPP_CALL_STATION = 3
 OPP_TAG = 4
 OPP_LAG = 5
+OPP_ROCK = 6
+OPP_TRAPPER = 7  # v3.3: Anti-aggro trapper
 
 
 def sample_opponent_types(
@@ -131,7 +137,7 @@ def sample_opponent_types(
     Returns:
         [N] array of opponent type indices (0=self, 1=historical, 2=random, etc.)
     """
-    # Build probability array in order: self, historical, random, call_station, tag, lag
+    # Build probability array in order: self, historical, random, call_station, tag, lag, rock, trapper
     probs = jnp.array([
         opponent_mix.get("self", 0.0),
         opponent_mix.get("historical", 0.0),  # v3.2
@@ -139,13 +145,15 @@ def sample_opponent_types(
         opponent_mix.get("call_station", 0.0),
         opponent_mix.get("tag", 0.0),
         opponent_mix.get("lag", 0.0),
+        opponent_mix.get("rock", 0.0),  # v3.3
+        opponent_mix.get("trapper", 0.0),  # v3.3: anti-aggro
     ])
     # Normalize
     probs = probs / probs.sum()
 
     # Sample using categorical
     logits = jnp.log(probs + 1e-10)  # Avoid log(0)
-    logits = jnp.broadcast_to(logits, (n_games, 6))  # 6 opponent types
+    logits = jnp.broadcast_to(logits, (n_games, 8))  # 8 opponent types
     opponent_types = jax.random.categorical(rng_key, logits)
 
     return opponent_types
@@ -181,9 +189,9 @@ def get_mixed_opponent_actions(
     """
     n_games = state.done.shape[0]
 
-    # Split RNG for each opponent type
-    keys = jrandom.split(rng_key, 6)
-    key_self, key_hist, key_random, key_call, key_tag, key_lag = keys
+    # Split RNG for each opponent type (8 types in v3.3)
+    keys = jrandom.split(rng_key, 8)
+    key_self, key_hist, key_random, key_call, key_tag, key_lag, key_rock, key_trapper = keys
 
     # Compute actions for each opponent type
     # Self: use network with current params
@@ -213,8 +221,14 @@ def get_mixed_opponent_actions(
     # LAG (needs obs)
     lag_actions = lag_opponent(state, valid_mask, key_lag, obs)
 
+    # Rock (needs obs) - v3.3
+    rock_actions = rock_opponent(state, valid_mask, key_rock, obs)
+
+    # Trapper (needs obs) - v3.3: anti-aggro opponent
+    trapper_actions = trapper_opponent(state, valid_mask, key_trapper, obs)
+
     # Select based on opponent type
-    # opponent_types: 0=self, 1=historical, 2=random, 3=call_station, 4=tag, 5=lag
+    # opponent_types: 0=self, 1=historical, 2=random, 3=call_station, 4=tag, 5=lag, 6=rock, 7=trapper
     actions = jnp.where(
         opponent_types == OPP_SELF, self_actions,
         jnp.where(
@@ -225,7 +239,13 @@ def get_mixed_opponent_actions(
                     opponent_types == OPP_CALL_STATION, call_actions,
                     jnp.where(
                         opponent_types == OPP_TAG, tag_actions,
-                        lag_actions  # Default to LAG
+                        jnp.where(
+                            opponent_types == OPP_LAG, lag_actions,
+                            jnp.where(
+                                opponent_types == OPP_ROCK, rock_actions,
+                                trapper_actions  # Default to trapper
+                            )
+                        )
                     )
                 )
             )

@@ -194,8 +194,10 @@ def load_csv_metrics(csv_path: Path | str) -> dict[str, list[float]]:
         csv_path: Path to CSV file
 
     Returns:
-        Dictionary mapping metric name to list of values
+        Dictionary mapping metric name to list of values.
+        Uses NaN for missing values to keep arrays aligned.
     """
+    import math
     metrics: dict[str, list[float]] = {}
 
     with open(csv_path, "r") as f:
@@ -207,9 +209,24 @@ def load_csv_metrics(csv_path: Path | str) -> dict[str, list[float]]:
                 try:
                     metrics[key].append(float(value))
                 except (ValueError, TypeError):
-                    pass
+                    metrics[key].append(math.nan)
 
     return metrics
+
+
+def _filter_nan_pairs(steps: list[float], values: list[float]) -> tuple[list[float], list[float]]:
+    """Filter out pairs where either value is NaN.
+
+    Returns aligned lists with NaN values removed.
+    """
+    import math
+    filtered_steps = []
+    filtered_values = []
+    for s, v in zip(steps, values):
+        if not math.isnan(s) and not math.isnan(v):
+            filtered_steps.append(s)
+            filtered_values.append(v)
+    return filtered_steps, filtered_values
 
 
 def plot_training_curves(
@@ -302,7 +319,9 @@ def plot_ppo_training(
     ]
     for ax, (key, title, color) in zip(axes, loss_metrics):
         if key in metrics:
-            ax.plot(steps, metrics[key], color=color, linewidth=1.5)
+            x, y = _filter_nan_pairs(steps, metrics[key])
+            if x:
+                ax.plot(x, y, color=color, linewidth=1.5)
             ax.set_xlabel("Step")
             ax.set_ylabel(title)
             ax.set_title(title)
@@ -314,18 +333,20 @@ def plot_ppo_training(
     # 2. Reward curve
     fig, ax = plt.subplots(figsize=(10, 5))
     if "reward/avg" in metrics:
-        ax.plot(steps, metrics["reward/avg"], color="tab:green", linewidth=1.5)
-        ax.set_xlabel("Step")
-        ax.set_ylabel("Average Reward")
-        ax.set_title("Training Reward")
-        ax.grid(True, alpha=0.3)
-        # Add smoothed line if enough data
-        if len(steps) > 20:
-            import numpy as np
-            window = min(20, len(steps) // 5)
-            smoothed = np.convolve(metrics["reward/avg"], np.ones(window)/window, mode="valid")
-            ax.plot(steps[window-1:], smoothed, color="darkgreen", linewidth=2, label="Smoothed")
-            ax.legend()
+        x, y = _filter_nan_pairs(steps, metrics["reward/avg"])
+        if x:
+            ax.plot(x, y, color="tab:green", linewidth=1.5)
+            ax.set_xlabel("Step")
+            ax.set_ylabel("Average Reward")
+            ax.set_title("Training Reward")
+            ax.grid(True, alpha=0.3)
+            # Add smoothed line if enough data
+            if len(x) > 20:
+                import numpy as np
+                window = min(20, len(x) // 5)
+                smoothed = np.convolve(y, np.ones(window)/window, mode="valid")
+                ax.plot(x[window-1:], smoothed, color="darkgreen", linewidth=2, label="Smoothed")
+                ax.legend()
     plt.tight_layout()
     plt.savefig(output_dir / "rewards.png", dpi=150, bbox_inches="tight")
     plt.close()
@@ -338,7 +359,9 @@ def plot_ppo_training(
     ]
     for ax, (key, title, color) in zip(axes, diag_metrics):
         if key in metrics:
-            ax.plot(steps, metrics[key], color=color, linewidth=1.5)
+            x, y = _filter_nan_pairs(steps, metrics[key])
+            if x:
+                ax.plot(x, y, color=color, linewidth=1.5)
             ax.set_xlabel("Step")
             ax.set_ylabel(title)
             ax.set_title(title)
@@ -355,7 +378,9 @@ def plot_ppo_training(
     ]
     for ax, (key, title, color) in zip(axes, perf_metrics):
         if key in metrics:
-            ax.plot(steps, metrics[key], color=color, linewidth=1.5)
+            x, y = _filter_nan_pairs(steps, metrics[key])
+            if x:
+                ax.plot(x, y, color=color, linewidth=1.5)
             ax.set_xlabel("Step")
             ax.set_ylabel(title)
             ax.set_title(title)
@@ -373,15 +398,17 @@ def plot_ppo_training(
     ]
     for ax, (key, title, color) in zip(axes, rl_metrics):
         if key in metrics:
-            ax.plot(steps, metrics[key], color=color, linewidth=1.5)
+            x, y = _filter_nan_pairs(steps, metrics[key])
+            if x:
+                ax.plot(x, y, color=color, linewidth=1.5)
+                # Add reference line for explained variance
+                if key == "rl/explained_variance":
+                    ax.axhline(y=1.0, color="gray", linestyle="--", alpha=0.5, label="Ideal")
+                    ax.legend()
             ax.set_xlabel("Step")
             ax.set_ylabel(title)
             ax.set_title(title)
             ax.grid(True, alpha=0.3)
-            # Add reference line for explained variance
-            if key == "rl/explained_variance":
-                ax.axhline(y=1.0, color="gray", linestyle="--", alpha=0.5, label="Ideal")
-                ax.legend()
     plt.tight_layout()
     plt.savefig(output_dir / "rl_diagnostics.png", dpi=150, bbox_inches="tight")
     plt.close()
@@ -391,14 +418,16 @@ def plot_ppo_training(
     # Win rate
     if "poker/win_rate" in metrics:
         ax = axes[0]
-        ax.plot(steps, metrics["poker/win_rate"], color="tab:green", linewidth=1.5)
-        ax.axhline(y=0.5, color="gray", linestyle="--", alpha=0.5, label="Break-even")
-        ax.set_xlabel("Step")
-        ax.set_ylabel("Win Rate")
-        ax.set_title("Win Rate Over Training")
-        ax.set_ylim(0, 1)
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+        x, y = _filter_nan_pairs(steps, metrics["poker/win_rate"])
+        if x:
+            ax.plot(x, y, color="tab:green", linewidth=1.5)
+            ax.axhline(y=0.5, color="gray", linestyle="--", alpha=0.5, label="Break-even")
+            ax.set_xlabel("Step")
+            ax.set_ylabel("Win Rate")
+            ax.set_title("Win Rate Over Training")
+            ax.set_ylim(0, 1)
+            ax.legend()
+            ax.grid(True, alpha=0.3)
     # Action distribution (stacked area) - supports both v2 (5 actions) and v3 (8 actions)
     # v3: 8 action types with 4 raise sizes
     v3_action_keys = ["poker/action_fold", "poker/action_check", "poker/action_call",
@@ -423,14 +452,25 @@ def plot_ppo_training(
     if action_keys:
         ax = axes[1]
         import numpy as np
-        action_data = np.array([metrics[k] for k in action_keys])
-        ax.stackplot(steps, action_data, labels=action_names, colors=action_colors, alpha=0.8)
-        ax.set_xlabel("Step")
-        ax.set_ylabel("Action Proportion")
-        ax.set_title("Action Distribution")
-        ax.set_ylim(0, 1)
-        ax.legend(loc="upper right", fontsize=7)
-        ax.grid(True, alpha=0.3)
+        import math
+        # Filter to only include rows where ALL action metrics have valid (non-NaN) values
+        valid_indices = []
+        for i in range(len(steps)):
+            if not math.isnan(steps[i]) and all(
+                i < len(metrics[k]) and not math.isnan(metrics[k][i])
+                for k in action_keys
+            ):
+                valid_indices.append(i)
+        if valid_indices:
+            filtered_steps = [steps[i] for i in valid_indices]
+            action_data = np.array([[metrics[k][i] for i in valid_indices] for k in action_keys])
+            ax.stackplot(filtered_steps, action_data, labels=action_names, colors=action_colors, alpha=0.8)
+            ax.set_xlabel("Step")
+            ax.set_ylabel("Action Proportion")
+            ax.set_title("Action Distribution")
+            ax.set_ylim(0, 1)
+            ax.legend(loc="upper right", fontsize=7)
+            ax.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(output_dir / "behavior.png", dpi=150, bbox_inches="tight")
     plt.close()
@@ -441,22 +481,25 @@ def plot_ppo_training(
     if "reward/avg" in metrics:
         import numpy as np
         ax = axes[0]
-        rewards = metrics["reward/avg"]
-        ax.plot(steps, rewards, color="tab:green", alpha=0.5, linewidth=1)
-        # Add trend line
-        if len(steps) > 2:
-            z = np.polyfit(steps, rewards, 1)
-            p = np.poly1d(z)
-            ax.plot(steps, p(steps), color="darkgreen", linewidth=2, label=f"Trend (slope={z[0]:.2e})")
-            ax.legend()
-        ax.set_xlabel("Step")
-        ax.set_ylabel("Average Reward")
-        ax.set_title("Reward Trend")
-        ax.grid(True, alpha=0.3)
+        x, y = _filter_nan_pairs(steps, metrics["reward/avg"])
+        if x:
+            ax.plot(x, y, color="tab:green", alpha=0.5, linewidth=1)
+            # Add trend line
+            if len(x) > 2:
+                z = np.polyfit(x, y, 1)
+                p = np.poly1d(z)
+                ax.plot(x, p(x), color="darkgreen", linewidth=2, label=f"Trend (slope={z[0]:.2e})")
+                ax.legend()
+            ax.set_xlabel("Step")
+            ax.set_ylabel("Average Reward")
+            ax.set_title("Reward Trend")
+            ax.grid(True, alpha=0.3)
     # Entropy decay
     if "loss/entropy" in metrics:
         ax = axes[1]
-        ax.plot(steps, metrics["loss/entropy"], color="tab:blue", linewidth=1.5)
+        x, y = _filter_nan_pairs(steps, metrics["loss/entropy"])
+        if x:
+            ax.plot(x, y, color="tab:blue", linewidth=1.5)
         ax.set_xlabel("Step")
         ax.set_ylabel("Entropy")
         ax.set_title("Policy Entropy (Exploration)")
