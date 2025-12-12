@@ -351,10 +351,15 @@ def train_rl_jax(
     adversarial: bool = typer.Option(False, "--adversarial", help="Train with adversarial exploiter (pure co-evolution, no fixed opponents)"),
     adversarial_checkpoint: Optional[str] = typer.Option(None, "--adversarial-checkpoint", help="Checkpoint to load for main model in adversarial training (exploiter starts random)"),
     adversarial_mix: float = typer.Option(0.5, "--adversarial-mix", help="Fraction of games vs historical opponents in adversarial mode (0=pure adversarial, 1=pure historical)"),
+    baseline_mix: float = typer.Option(0.3, "--baseline-mix", help="Fraction of games vs rule-based opponents (random, call_station, tag). Set to 0 for pure self-play."),
     fold_dropout: float = typer.Option(0.05, "--fold-dropout", help="Force fold action this % of time when facing a bet (exploration, 0.05=5%)"),
+    # Stack depth
+    starting_chips: int = typer.Option(200, "--starting-chips", help="Starting chips per player (200=100BB, 1000=500BB for deeper play)"),
     # Eval checkpoints during training
     eval_every: int = typer.Option(10_000_000, "--eval-every", help="Steps between eval checkpoints (0=disabled). Detects degenerate strategies early."),
     eval_games: int = typer.Option(2000, "--eval-games", help="Games per opponent for eval checkpoint (default 2000)"),
+    # Resume from checkpoint
+    resume: Optional[str] = typer.Option(None, "--resume", "-r", help="Resume from checkpoint file (e.g., models/v7/checkpoints/step_09600000.pkl)"),
 ) -> None:
     """Train poker AI using JAX-accelerated PPO (GPU-optimized)."""
     try:
@@ -427,11 +432,13 @@ def train_rl_jax(
         checkpoint_every=50_000,
         checkpoint_dir=checkpoint_dir,
         tensorboard_dir=tensorboard,
+        starting_chips=starting_chips,
         use_mixed_opponents=mixed_opponents,
         use_historical_selfplay=historical_selfplay,
         use_adversarial_training=adversarial,
         adversarial_main_checkpoint=adversarial_checkpoint,
         adversarial_historical_mix=adversarial_mix,
+        adversarial_baseline_mix=baseline_mix,
         fold_dropout_rate=fold_dropout,
         eval_checkpoint_every=eval_every,
         eval_checkpoint_games=eval_games,
@@ -445,6 +452,18 @@ def train_rl_jax(
         console=console,
     )
 
+    # Resume from checkpoint if specified
+    start_step = 0
+    if resume:
+        from pathlib import Path
+        resume_path = Path(resume)
+        if not resume_path.exists():
+            console.print(f"[red]Checkpoint not found: {resume}[/red]")
+            raise typer.Exit(1)
+        console.print(f"[cyan]Loading checkpoint: {resume}[/cyan]")
+        start_step = trainer.load_checkpoint(resume_path)
+        console.print(f"[cyan]Resuming from step {start_step:,}[/cyan]")
+
     # Run training
     if background:
         console.print("\n[yellow]Background mode not yet implemented.[/yellow]")
@@ -454,7 +473,7 @@ def train_rl_jax(
     console.print(f"\n[bold]Starting JAX training for {steps:,} steps...[/bold]\n")
 
     try:
-        metrics = trainer.train(show_progress=True)
+        metrics = trainer.train(show_progress=True, start_step=start_step)
     except KeyboardInterrupt:
         console.print("\n[yellow]Training interrupted.[/yellow]")
 

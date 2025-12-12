@@ -1502,32 +1502,38 @@ class JAXTrainer:
         self,
         callback: Callable[[int, TrainingMetrics, PPOMetrics], None] | None = None,
         show_progress: bool = True,
+        start_step: int = 0,
     ) -> TrainingMetrics:
         """Run the full training loop.
 
         Args:
             callback: Optional callback(steps, metrics, ppo_metrics) after each update
             show_progress: Show progress bar
+            start_step: Starting step count (for resuming from checkpoint)
 
         Returns:
             Final training metrics
         """
         config = self.training_config
         total_updates = config.total_steps // config.steps_per_update
+        start_update = start_step // config.steps_per_update
 
         checkpoint_dir = Path(config.checkpoint_dir)
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         self.console.print(f"\n[bold]Starting training...[/bold]")
+        if start_step > 0:
+            self.console.print(f"[cyan]Resuming from step {start_step:,} (update {start_update:,})[/cyan]")
         self.console.print(f"Total steps: {config.total_steps:,}")
-        self.console.print(f"Updates: {total_updates:,}")
+        self.console.print(f"Updates: {total_updates:,} ({total_updates - start_update:,} remaining)")
 
-        iterator = range(total_updates)
+        iterator = range(start_update, total_updates)
         if show_progress:
             # mininterval=5.0 reduces terminal I/O overhead (update display max every 5 seconds)
-            iterator = tqdm(iterator, desc="Training", unit="updates", mininterval=5.0)
+            iterator = tqdm(iterator, desc="Training", unit="updates", mininterval=5.0,
+                           initial=start_update, total=total_updates)
 
-        global_step = 0
+        global_step = start_step
         total_games = 0
         start_time = time.time()
 
@@ -1867,15 +1873,30 @@ class JAXTrainer:
         with open(path, "wb") as f:
             pickle.dump(checkpoint, f)
 
-    def load_checkpoint(self, path: Path | str) -> None:
-        """Load checkpoint."""
-        import pickle
+    def load_checkpoint(self, path: Path | str) -> int:
+        """Load checkpoint and return step count.
 
+        Args:
+            path: Path to checkpoint file
+
+        Returns:
+            Step count extracted from filename (e.g., step_09600000.pkl -> 9600000)
+        """
+        import pickle
+        import re
+
+        path = Path(path)
         with open(path, "rb") as f:
             checkpoint = pickle.load(f)
 
         self.params = checkpoint["params"]
         self.opt_state = checkpoint["opt_state"]
+
+        # Extract step count from filename
+        match = re.search(r"step_(\d+)", path.stem)
+        if match:
+            return int(match.group(1))
+        return 0
 
 
 def create_jax_trainer(

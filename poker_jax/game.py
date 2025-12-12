@@ -588,23 +588,16 @@ def step(
 def get_rewards(state: GameState) -> Array:
     """Calculate rewards for completed games.
 
-    Rewards are scaled by pot size (sqrt) to emphasize big pot decisions.
-    This helps the model learn to play well in large pots, improving BB/100.
-
     Args:
         state: Game state
 
     Returns:
-        [N, 2] rewards for each player (pot-scaled chip delta)
+        [N, 2] rewards for each player (chips won - chips invested)
     """
     n_games = state.done.shape[0]
 
     # Calculate final pot
     pot = state.pot + state.bets[:, 0] + state.bets[:, 1]
-
-    # Pot importance scaling: sqrt to balance emphasis without extreme variance
-    # Small pots (6 chips): 0.17x, Medium (50): 0.5x, Large (200): 1.0x, All-in (400): 1.4x
-    pot_scale = jnp.sqrt(pot / state.starting_chips)
 
     # Rewards based on winner
     # Winner gets pot, loser gets nothing
@@ -628,10 +621,6 @@ def get_rewards(state: GameState) -> Array:
             pot / 2 - state.total_invested[:, 1]  # Tie
         )
     )
-
-    # Apply pot scaling to emphasize big pot decisions
-    p0_reward = p0_reward * pot_scale
-    p1_reward = p1_reward * pot_scale
 
     # Zero reward for incomplete games
     p0_reward = jnp.where(state.done, p0_reward, 0.0)
