@@ -148,6 +148,10 @@ class JAXTrainingConfig:
     adversarial_baseline_mix: float = 0.3  # Fraction of games vs rule-based opponents (random, call_station, tag)
     fold_dropout_rate: float = 0.05  # Force fold action this % of time when facing a bet (exploration)
 
+    # Eval checkpoints during training (early detection of degenerate strategies)
+    eval_checkpoint_every: int = 0  # Steps between evaluations (0=disabled). Recommended: 10_000_000
+    eval_checkpoint_games: int = 2000  # Games per opponent for checkpoint eval
+
 
 # Opponent type indices for mixed training
 OPP_SELF = 0
@@ -504,12 +508,13 @@ class JAXTrainer:
                 # Seed pool with main model's initial state
                 self.checkpoint_pool.add_checkpoint(self.params, 0)
 
-            mix_pct = self.training_config.adversarial_historical_mix
-            self.console.print(f"[bold magenta]Adversarial Training (v4)[/bold magenta]")
-            if mix_pct > 0:
-                self.console.print(f"  Hybrid mode: {mix_pct:.0%} historical / {1-mix_pct:.0%} exploiter")
-            else:
-                self.console.print(f"  Pure co-evolution: Main vs Exploiter only")
+            hist_mix = self.training_config.adversarial_historical_mix
+            baseline_mix = self.training_config.adversarial_baseline_mix
+            exploiter_mix = max(0.0, 1.0 - hist_mix - baseline_mix)
+            self.console.print(f"[bold magenta]Adversarial Training (v5)[/bold magenta]")
+            self.console.print(f"  Opponent mix: {exploiter_mix:.0%} exploiter, {hist_mix:.0%} historical, {baseline_mix:.0%} baseline")
+            if baseline_mix > 0:
+                self.console.print(f"  Baselines: random, call_station, tag (equal split)")
             self.console.print(f"  Exploiter update freq: every {self.training_config.exploiter_update_freq} main update(s)")
         elif self.training_config.use_historical_selfplay:
             # Only show opponent scheduling if NOT in adversarial mode
@@ -747,15 +752,15 @@ class JAXTrainer:
         main_params: dict,
         exploiter_params: dict,
         historical_params: dict,
-        use_historical_mask: Array,  # [N] bool: True = use historical, False = use exploiter
+        opponent_types: Array,  # [N] int: 0=exploiter, 1=historical, 2=random, 3=call_station, 4=tag
         fold_dropout_rate: float,  # Force fold this % of time when facing bet
         state: GameState,
         rng_key: Array,
     ) -> tuple[GameState, Array, Array, Array, Array, Array, Array, Array, Array, Array]:
-        """Core hybrid adversarial step - mixes historical and exploiter opponents.
+        """Core hybrid adversarial step - mixes historical, exploiter, and baseline opponents.
 
         - Player 0 = Main model (always)
-        - Player 1 = Historical (for some games) or Exploiter (for others)
+        - Player 1 = Exploiter, Historical, or Baseline (random/call_station/tag)
 
         Returns:
             Tuple of (new_state, obs, actions, log_probs, main_values, exp_values,
@@ -787,13 +792,21 @@ class JAXTrainer:
             {"params": historical_params}, obs, training=False
         )
 
-        # Select opponent logits based on game type (historical vs exploiter)
-        # For games with use_historical_mask=True, use hist_logits
-        # For games with use_historical_mask=False, use exp_logits
+        # Baseline opponent actions (rule-based, computed for all games but only used for some)
+        rng_key, baseline_key = jrandom.split(rng_key)
+        random_actions = random_opponent(state, valid_mask, baseline_key)
+        call_station_actions = call_station_opponent(state, valid_mask, baseline_key)
+        tag_actions = tag_opponent(state, valid_mask, baseline_key, obs)
+
+        # Select opponent logits/actions based on game type
+        # Start with exploiter as default
+        opponent_logits = exp_logits
+
+        # Override with historical for those games
         opponent_logits = jnp.where(
-            use_historical_mask[:, None],
+            (opponent_types == OPP_HISTORICAL)[:, None],
             hist_logits,
-            exp_logits
+            opponent_logits
         )
 
         # Select logits based on whose turn
@@ -819,9 +832,21 @@ class JAXTrainer:
             valid_mask
         )
 
-        # Sample actions
+        # Sample actions from network logits
         rng_key, action_key = jrandom.split(rng_key)
         actions, log_probs = sample_action(action_key, action_logits, effective_valid_mask)
+
+        # Override with baseline opponent actions when it's opponent's turn and using baseline
+        # Baseline actions are already 1-indexed (ACTION_FOLD=1, etc.), need to convert to 0-indexed
+        is_opponent_turn = ~is_player0_turn
+        use_random = is_opponent_turn & (opponent_types == OPP_RANDOM)
+        use_call_station = is_opponent_turn & (opponent_types == OPP_CALL_STATION)
+        use_tag = is_opponent_turn & (opponent_types == OPP_TAG)
+
+        # Convert baseline actions to 0-indexed (they return 1-indexed game actions)
+        actions = jnp.where(use_random, random_actions - 1, actions)
+        actions = jnp.where(use_call_station, call_station_actions - 1, actions)
+        actions = jnp.where(use_tag, tag_actions - 1, actions)
 
         # Game actions (convert 0-indexed to 1-indexed)
         game_actions = actions + 1
@@ -1213,13 +1238,31 @@ class JAXTrainer:
         """
         network = self.network
         config = self.training_config
-        mix = config.adversarial_historical_mix
+        hist_mix = config.adversarial_historical_mix
+        baseline_mix = config.adversarial_baseline_mix
         n_games = config.num_parallel_games
 
-        # Pre-compute which games use historical vs exploiter
-        # First N games use historical, rest use exploiter
-        n_historical = int(n_games * mix)
-        use_historical_mask = jnp.arange(n_games) < n_historical
+        # Pre-compute opponent types for each game
+        # Split: [exploiter games] [historical games] [random] [call_station] [tag]
+        # Remaining after hist and baseline goes to exploiter
+        exploiter_frac = max(0.0, 1.0 - hist_mix - baseline_mix)
+        n_exploiter = int(n_games * exploiter_frac)
+        n_historical = int(n_games * hist_mix)
+        n_baseline = n_games - n_exploiter - n_historical
+
+        # Split baseline equally among random, call_station, tag
+        n_random = n_baseline // 3
+        n_call_station = n_baseline // 3
+        n_tag = n_baseline - n_random - n_call_station
+
+        # Create opponent_types array: 0=exploiter, 1=historical, 2=random, 3=call_station, 4=tag
+        opponent_types = jnp.concatenate([
+            jnp.full(n_exploiter, OPP_SELF, dtype=jnp.int32),  # 0 = exploiter (same as self for this context)
+            jnp.full(n_historical, OPP_HISTORICAL, dtype=jnp.int32),
+            jnp.full(n_random, OPP_RANDOM, dtype=jnp.int32),
+            jnp.full(n_call_station, OPP_CALL_STATION, dtype=jnp.int32),
+            jnp.full(n_tag, OPP_TAG, dtype=jnp.int32),
+        ])
 
         @jax.jit
         def scan_step(carry, _):
@@ -1229,11 +1272,11 @@ class JAXTrainer:
             # Split RNG
             rng_key, step_key, reset_key = jrandom.split(rng_key, 3)
 
-            # Run hybrid core step (three forward passes)
+            # Run hybrid core step (three forward passes + baseline opponents)
             (new_state, obs, actions, log_probs, main_values, exp_values,
              rewards_p0, rewards_p1, dones, valid_mask) = self._adversarial_step_core_hybrid(
                 network, main_params, exp_params, hist_params,
-                use_historical_mask, config.fold_dropout_rate, state, step_key
+                opponent_types, config.fold_dropout_rate, state, step_key
             )
 
             # Main is always learning: use main's values, p0's rewards
@@ -1362,6 +1405,98 @@ class JAXTrainer:
         )
 
         return trajectory, metrics
+
+    def _run_eval_checkpoint(
+        self,
+        num_games: int = 2000,
+    ) -> dict[str, dict[str, float]]:
+        """Run lightweight evaluation against key opponents during training.
+
+        Tests against random and call_station to detect degenerate strategies.
+
+        Args:
+            num_games: Games per opponent (split between positions)
+
+        Returns:
+            Dict mapping opponent name to {win_rate, bb_per_100}
+        """
+        config = self.training_config
+        results = {}
+
+        opponents = [
+            ("random", random_opponent),
+            ("call_station", call_station_opponent),
+        ]
+
+        for opp_name, opp_fn in opponents:
+            # Run evaluation games
+            games_per_position = num_games // 2
+            total_wins = 0
+            total_losses = 0
+            total_chip_delta = 0.0
+
+            for model_position in [0, 1]:
+                # Initialize games
+                self.rng_key, reset_key = jrandom.split(self.rng_key)
+                state = reset(reset_key, games_per_position, config.starting_chips)
+
+                # Run until all games done
+                max_steps = 500  # Safety limit
+                for _ in range(max_steps):
+                    if state.done.all():
+                        break
+
+                    # Get observation
+                    obs = encode_state_for_current_player(state)
+                    valid_mask = get_valid_actions_from_obs(obs)
+
+                    # Determine who acts
+                    is_model_turn = state.current_player == model_position
+
+                    # Model action
+                    self.rng_key, action_key = jrandom.split(self.rng_key)
+                    model_logits, _, _ = self.network.apply(
+                        {"params": self.params}, obs, training=False
+                    )
+                    model_actions, _ = sample_action(action_key, model_logits, valid_mask)
+                    # Convert from 1-indexed to 0-indexed for step()
+                    model_actions = model_actions - 1
+
+                    # Opponent action
+                    self.rng_key, opp_key = jrandom.split(self.rng_key)
+                    if opp_name in NEEDS_OBS:
+                        opp_actions = opp_fn(state, valid_mask, opp_key, obs) - 1
+                    else:
+                        opp_actions = opp_fn(state, valid_mask, opp_key) - 1
+
+                    # Select action based on current player
+                    actions = jnp.where(is_model_turn[:, None], model_actions[:, None], opp_actions[:, None]).squeeze(-1)
+
+                    # Step
+                    state = step(state, actions)
+
+                # Get results
+                rewards = get_rewards(state)
+                model_rewards = rewards[:, model_position]
+
+                total_wins += int((model_rewards > 0).sum())
+                total_losses += int((model_rewards < 0).sum())
+                total_chip_delta += float(model_rewards.sum())
+
+            # Compute metrics
+            decided = total_wins + total_losses
+            win_rate = total_wins / max(decided, 1)
+            # BB/100 = (chips won / hands) * 100 / big_blind
+            bb_per_100 = (total_chip_delta / num_games) * 100 / 2  # big_blind = 2
+
+            results[opp_name] = {
+                "win_rate": win_rate,
+                "bb_per_100": bb_per_100,
+                "wins": total_wins,
+                "losses": total_losses,
+            }
+
+        return results
 
     def train(
         self,
@@ -1656,6 +1791,35 @@ class JAXTrainer:
                             f"R33={exp_ac['raise_33']:>3} R66={exp_ac['raise_66']:>3} R100={exp_ac['raise_100']:>3} R150={exp_ac['raise_150']:>3} A={exp_ac['all_in']:>4} | "
                             f"games: {exp_collect_metrics.games_completed} done, {exp_collect_metrics.wins}W/{exp_collect_metrics.losses}L"
                         )
+
+                # Eval checkpoint (early detection of degenerate strategies)
+                if config.eval_checkpoint_every > 0 and global_step > 0:
+                    if global_step % config.eval_checkpoint_every < config.steps_per_update:
+                        eval_results = self._run_eval_checkpoint(config.eval_checkpoint_games)
+
+                        # Log to file
+                        if self.file_logger:
+                            self.file_logger.info(
+                                f"[EVAL] step={global_step:>8} | "
+                                f"vs_random: {eval_results['random']['win_rate']:.1%} ({eval_results['random']['bb_per_100']:+.1f} BB/100) | "
+                                f"vs_call_station: {eval_results['call_station']['win_rate']:.1%} ({eval_results['call_station']['bb_per_100']:+.1f} BB/100)"
+                            )
+
+                        # Log to TensorBoard
+                        if self.logger:
+                            self.logger.log(global_step, {
+                                "eval/random_win_rate": eval_results["random"]["win_rate"],
+                                "eval/random_bb_per_100": eval_results["random"]["bb_per_100"],
+                                "eval/call_station_win_rate": eval_results["call_station"]["win_rate"],
+                                "eval/call_station_bb_per_100": eval_results["call_station"]["bb_per_100"],
+                            })
+
+                        # Warn if losing to random
+                        if eval_results["random"]["win_rate"] < 0.5:
+                            self.console.print(
+                                f"[bold red]WARNING[/bold red]: Model losing to random play "
+                                f"({eval_results['random']['win_rate']:.1%} win rate) at step {global_step:,}"
+                            )
 
                 # Checkpointing
                 if global_step % config.checkpoint_every == 0:

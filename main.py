@@ -352,6 +352,9 @@ def train_rl_jax(
     adversarial_checkpoint: Optional[str] = typer.Option(None, "--adversarial-checkpoint", help="Checkpoint to load for main model in adversarial training (exploiter starts random)"),
     adversarial_mix: float = typer.Option(0.5, "--adversarial-mix", help="Fraction of games vs historical opponents in adversarial mode (0=pure adversarial, 1=pure historical)"),
     fold_dropout: float = typer.Option(0.05, "--fold-dropout", help="Force fold action this % of time when facing a bet (exploration, 0.05=5%)"),
+    # Eval checkpoints during training
+    eval_every: int = typer.Option(10_000_000, "--eval-every", help="Steps between eval checkpoints (0=disabled). Detects degenerate strategies early."),
+    eval_games: int = typer.Option(2000, "--eval-games", help="Games per opponent for eval checkpoint (default 2000)"),
 ) -> None:
     """Train poker AI using JAX-accelerated PPO (GPU-optimized)."""
     try:
@@ -430,6 +433,8 @@ def train_rl_jax(
         adversarial_main_checkpoint=adversarial_checkpoint,
         adversarial_historical_mix=adversarial_mix,
         fold_dropout_rate=fold_dropout,
+        eval_checkpoint_every=eval_every,
+        eval_checkpoint_games=eval_games,
     )
 
     # Create trainer
