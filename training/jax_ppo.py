@@ -192,12 +192,13 @@ def ppo_loss(
 
     # Apply model_masks if provided (only backprop on model's turns)
     if model_masks is not None:
-        # Masked mean for policy loss and entropy (only train on model's decisions)
+        # Masked mean for policy loss, entropy, AND value loss (only train on model's decisions)
+        # Training value function on opponent turns corrupts it - it learns to predict
+        # opponent's returns rather than its own future returns
         mask_sum = jnp.maximum(model_masks.sum(), 1.0)  # Avoid div by 0
         policy_loss = (per_sample_policy_loss * model_masks).sum() / mask_sum
         entropy = (per_sample_entropy * model_masks).sum() / mask_sum
-        # Value loss can use all samples (value function learns from all observations)
-        value_loss = per_sample_value_loss.mean()
+        value_loss = (per_sample_value_loss * model_masks).sum() / mask_sum
     else:
         # No masking - use all samples (backward compat for self-play)
         policy_loss = per_sample_policy_loss.mean()

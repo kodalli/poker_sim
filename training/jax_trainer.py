@@ -142,9 +142,10 @@ class JAXTrainingConfig:
     # Adversarial self-play (v4) - train against learned exploiter
     # Replaces all fixed opponents with a co-evolving exploiter model
     use_adversarial_training: bool = False
-    exploiter_update_freq: int = 5  # Update exploiter every N main updates (5 = slower adaptation)
+    exploiter_update_freq: int = 1  # Update exploiter every main update (symmetric co-evolution)
     adversarial_main_checkpoint: str | None = None  # Load main model from this checkpoint (exploiter starts random)
     adversarial_historical_mix: float = 0.5  # Fraction of games vs historical (0=pure adversarial, 1=pure historical)
+    adversarial_baseline_mix: float = 0.3  # Fraction of games vs rule-based opponents (random, call_station, tag)
     fold_dropout_rate: float = 0.05  # Force fold action this % of time when facing a bet (exploration)
 
 

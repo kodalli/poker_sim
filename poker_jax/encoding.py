@@ -11,7 +11,7 @@ from poker_jax.state import GameState, ROUND_PREFLOP, MAX_HISTORY, NUM_ACTIONS
 from poker_jax.deck import cards_to_one_hot, NUM_CARDS
 from poker_jax.hands import compute_hand_strength_batch
 
-# Observation dimension breakdown (v3):
+# Observation dimension breakdown (v5):
 # - Hole cards: 52 * 2 = 104 (one-hot for each card)
 # - Community cards: 52 * 5 = 260 (one-hot for each card)
 # - Round: 4 (one-hot: preflop, flop, turn, river)
@@ -24,13 +24,13 @@ from poker_jax.hands import compute_hand_strength_batch
 # - To call (normalized): 1
 # - Valid actions: 9 (fold, check, call, raise_33, raise_66, raise_100, raise_150, all_in)
 # - Hand strength: 18 (10 category one-hot + 1 strength + 4 draws + 3 texture)
-# - Action history: 30 (10 actions * 3 features each)
-# Total: 104 + 260 + 4 + 2 + 6 + 9 + 18 + 30 = 433
+# - Action history: 40 (10 actions * 4 features: player_id, action_type, bet_amount, position)
+# Total: 104 + 260 + 4 + 2 + 6 + 9 + 18 + 40 = 443
 
 HAND_STRENGTH_DIM = 18
-ACTION_HISTORY_DIM = MAX_HISTORY * 3  # 10 * 3 = 30
+ACTION_HISTORY_DIM = MAX_HISTORY * 4  # 10 * 4 = 40 (added position encoding)
 
-OBS_DIM = 433
+OBS_DIM = 443
 
 
 @jax.jit
@@ -140,9 +140,15 @@ def encode_state(state: GameState, player_id: int = 0) -> Array:
     # === Hand strength features (18 dims) ===
     hand_strength = compute_hand_strength_batch(my_hole, state.community)  # [N, 18]
 
-    # === Action history (30 dims) ===
-    # Flatten action history: [N, 10, 3] -> [N, 30]
-    action_history_flat = state.action_history.reshape(n_games, -1)  # [N, 30]
+    # === Action history (40 dims) ===
+    # Add positional encoding to each action slot for temporal structure
+    # Original: [N, 10, 3] with features [player_id, action_type, bet_amount]
+    # Enhanced: [N, 10, 4] with features [player_id, action_type, bet_amount, position]
+    # Position = slot_index / 10.0 (0.0 = oldest, 0.9 = most recent)
+    position_encoding = jnp.arange(MAX_HISTORY, dtype=jnp.float32) / MAX_HISTORY  # [10]
+    position_encoding = jnp.broadcast_to(position_encoding[None, :, None], (n_games, MAX_HISTORY, 1))  # [N, 10, 1]
+    action_history_with_pos = jnp.concatenate([state.action_history, position_encoding], axis=2)  # [N, 10, 4]
+    action_history_flat = action_history_with_pos.reshape(n_games, -1)  # [N, 40]
 
     # === Concatenate all features ===
     obs = jnp.concatenate([
@@ -158,7 +164,7 @@ def encode_state(state: GameState, player_id: int = 0) -> Array:
         to_call_norm,         # 1
         valid_actions_full,   # 9
         hand_strength,        # 18
-        action_history_flat,  # 30
+        action_history_flat,  # 40 (was 30, now includes position encoding)
     ], axis=1)
 
     return obs
