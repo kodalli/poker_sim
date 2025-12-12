@@ -139,6 +139,14 @@ class JAXTrainingConfig:
         }),
     ])
 
+    # Adversarial self-play (v4) - train against learned exploiter
+    # Replaces all fixed opponents with a co-evolving exploiter model
+    use_adversarial_training: bool = False
+    exploiter_update_freq: int = 5  # Update exploiter every N main updates (5 = slower adaptation)
+    adversarial_main_checkpoint: str | None = None  # Load main model from this checkpoint (exploiter starts random)
+    adversarial_historical_mix: float = 0.5  # Fraction of games vs historical (0=pure adversarial, 1=pure historical)
+    fold_dropout_rate: float = 0.05  # Force fold action this % of time when facing a bet (exploration)
+
 
 # Opponent type indices for mixed training
 OPP_SELF = 0
@@ -465,7 +473,45 @@ class JAXTrainer:
             )
             self.console.print(f"[bold cyan]Historical Self-Play (v3.2)[/bold cyan]")
 
-            # Dynamic scheduling info (v3.4)
+        # Adversarial training (v4) - exploiter model
+        self.exploiter_params = None
+        self.exploiter_opt_state = None
+        if self.training_config.use_adversarial_training:
+            # Load main model from checkpoint if provided (warm start)
+            if self.training_config.adversarial_main_checkpoint:
+                import pickle
+                ckpt_path = Path(self.training_config.adversarial_main_checkpoint)
+                if ckpt_path.exists():
+                    with open(ckpt_path, "rb") as f:
+                        checkpoint = pickle.load(f)
+                    self.params = checkpoint["params"]
+                    self.opt_state = self.optimizer.init(self.params)  # Fresh optimizer state
+                    self.console.print(f"[bold green]Loaded main model from {ckpt_path}[/bold green]")
+                else:
+                    self.console.print(f"[yellow]Warning: Checkpoint {ckpt_path} not found, using random init[/yellow]")
+
+            # Initialize exploiter with random weights (will learn to exploit main)
+            self.rng_key, exp_init_key = jrandom.split(self.rng_key)
+            self.exploiter_params = init_network(network, exp_init_key, OBS_DIM)
+            self.exploiter_opt_state = self.optimizer.init(self.exploiter_params)
+
+            # Initialize historical pool for hybrid training (v4 + historical)
+            if self.training_config.adversarial_historical_mix > 0:
+                self.checkpoint_pool = CheckpointPool(
+                    max_size=self.training_config.historical_pool_size
+                )
+                # Seed pool with main model's initial state
+                self.checkpoint_pool.add_checkpoint(self.params, 0)
+
+            mix_pct = self.training_config.adversarial_historical_mix
+            self.console.print(f"[bold magenta]Adversarial Training (v4)[/bold magenta]")
+            if mix_pct > 0:
+                self.console.print(f"  Hybrid mode: {mix_pct:.0%} historical / {1-mix_pct:.0%} exploiter")
+            else:
+                self.console.print(f"  Pure co-evolution: Main vs Exploiter only")
+            self.console.print(f"  Exploiter update freq: every {self.training_config.exploiter_update_freq} main update(s)")
+        elif self.training_config.use_historical_selfplay:
+            # Only show opponent scheduling if NOT in adversarial mode
             if self.training_config.use_dynamic_opponent_schedule and self.training_config.opponent_schedule:
                 self.console.print(f"  [bold yellow]Dynamic Opponent Scheduling (v3.4)[/bold yellow]")
                 for step, mix in self.training_config.opponent_schedule:
@@ -473,7 +519,6 @@ class JAXTrainer:
             else:
                 mix = self.training_config.historical_opponent_mix
                 self.console.print(f"  Opponent mix: {', '.join(f'{k}={v:.0%}' for k,v in mix.items())}")
-
             self.console.print(f"  Pool size: {self.training_config.historical_pool_size}")
             self.console.print(f"  Save every: {self.training_config.historical_save_every:,} steps")
 
@@ -620,6 +665,186 @@ class JAXTrainer:
 
         return new_state, obs, trajectory_actions, log_probs, values, model_rewards, dones, valid_mask, model_turn_mask
 
+    @staticmethod
+    @partial(jax.jit, static_argnums=(0,))
+    def _adversarial_step_core(
+        network: ActorCriticMLP,
+        main_params: dict,
+        exploiter_params: dict,
+        state: GameState,
+        rng_key: Array,
+    ) -> tuple[GameState, Array, Array, Array, Array, Array, Array, Array, Array, Array]:
+        """Core adversarial step - returns data for both players.
+
+        Both players use neural network policies.
+        - Player 0 = Main model
+        - Player 1 = Exploiter
+
+        Returns:
+            Tuple of (new_state, obs, actions, log_probs, main_values, exp_values,
+                     rewards_p0, rewards_p1, dones, valid_mask)
+        """
+        n_games = state.done.shape[0]
+
+        # Encode state for current player
+        obs = encode_state_for_current_player(state)
+        valid_mask = get_valid_actions_from_obs(obs)
+
+        # Whose turn is it?
+        is_player0_turn = state.current_player == 0  # Main's turn
+
+        # Main forward pass
+        main_logits, _, main_values = network.apply(
+            {"params": main_params}, obs, training=False
+        )
+        main_values = main_values.squeeze(-1)
+
+        # Exploiter forward pass
+        exp_logits, _, exp_values = network.apply(
+            {"params": exploiter_params}, obs, training=False
+        )
+        exp_values = exp_values.squeeze(-1)
+
+        # Select logits based on whose turn (but return both values for PPO)
+        action_logits = jnp.where(
+            is_player0_turn[:, None],
+            main_logits,
+            exp_logits
+        )
+
+        # Sample actions
+        rng_key, action_key = jrandom.split(rng_key)
+        actions, log_probs = sample_action(action_key, action_logits, valid_mask)
+
+        # Game actions (convert 0-indexed to 1-indexed)
+        game_actions = actions + 1
+
+        # Compute raise amounts
+        opp_idx = 1 - state.current_player
+        game_idx = jnp.arange(n_games)
+        opp_bet = state.bets[game_idx, opp_idx]
+        raise_amounts = opp_bet + state.last_raise_amount
+
+        # Step environment
+        new_state = step(state, game_actions, raise_amounts)
+
+        # Get rewards for both players
+        rewards = get_rewards(new_state)
+        rewards_p0 = rewards[:, 0]
+        rewards_p1 = rewards[:, 1]
+
+        # Done flags
+        dones = new_state.done.astype(jnp.float32)
+
+        return (new_state, obs, actions, log_probs, main_values, exp_values,
+                rewards_p0, rewards_p1, dones, valid_mask)
+
+    @staticmethod
+    @partial(jax.jit, static_argnums=(0, 5))
+    def _adversarial_step_core_hybrid(
+        network: ActorCriticMLP,
+        main_params: dict,
+        exploiter_params: dict,
+        historical_params: dict,
+        use_historical_mask: Array,  # [N] bool: True = use historical, False = use exploiter
+        fold_dropout_rate: float,  # Force fold this % of time when facing bet
+        state: GameState,
+        rng_key: Array,
+    ) -> tuple[GameState, Array, Array, Array, Array, Array, Array, Array, Array, Array]:
+        """Core hybrid adversarial step - mixes historical and exploiter opponents.
+
+        - Player 0 = Main model (always)
+        - Player 1 = Historical (for some games) or Exploiter (for others)
+
+        Returns:
+            Tuple of (new_state, obs, actions, log_probs, main_values, exp_values,
+                     rewards_p0, rewards_p1, dones, valid_mask)
+        """
+        n_games = state.done.shape[0]
+
+        # Encode state for current player
+        obs = encode_state_for_current_player(state)
+        valid_mask = get_valid_actions_from_obs(obs)
+
+        # Whose turn is it?
+        is_player0_turn = state.current_player == 0  # Main's turn
+
+        # Main forward pass
+        main_logits, _, main_values = network.apply(
+            {"params": main_params}, obs, training=False
+        )
+        main_values = main_values.squeeze(-1)
+
+        # Exploiter forward pass
+        exp_logits, _, exp_values = network.apply(
+            {"params": exploiter_params}, obs, training=False
+        )
+        exp_values = exp_values.squeeze(-1)
+
+        # Historical forward pass
+        hist_logits, _, _ = network.apply(
+            {"params": historical_params}, obs, training=False
+        )
+
+        # Select opponent logits based on game type (historical vs exploiter)
+        # For games with use_historical_mask=True, use hist_logits
+        # For games with use_historical_mask=False, use exp_logits
+        opponent_logits = jnp.where(
+            use_historical_mask[:, None],
+            hist_logits,
+            exp_logits
+        )
+
+        # Select logits based on whose turn
+        # Player 0 (main) uses main_logits, Player 1 (opponent) uses opponent_logits
+        action_logits = jnp.where(
+            is_player0_turn[:, None],
+            main_logits,
+            opponent_logits
+        )
+
+        # Fold dropout: occasionally force fold when facing a bet (exploration)
+        # This helps the model learn fold values since fold/loss have same reward
+        rng_key, dropout_key = jrandom.split(rng_key)
+        can_call = valid_mask[:, ACTION_CALL] > 0.5  # Facing a bet
+        apply_dropout = jrandom.uniform(dropout_key, (n_games,)) < fold_dropout_rate
+        force_fold = can_call & apply_dropout & is_player0_turn  # Only for main model
+
+        # When force_fold, only allow fold action
+        fold_only_mask = jnp.zeros_like(valid_mask).at[:, ACTION_FOLD].set(1.0)
+        effective_valid_mask = jnp.where(
+            force_fold[:, None],
+            fold_only_mask,
+            valid_mask
+        )
+
+        # Sample actions
+        rng_key, action_key = jrandom.split(rng_key)
+        actions, log_probs = sample_action(action_key, action_logits, effective_valid_mask)
+
+        # Game actions (convert 0-indexed to 1-indexed)
+        game_actions = actions + 1
+
+        # Compute raise amounts
+        opp_idx = 1 - state.current_player
+        game_idx = jnp.arange(n_games)
+        opp_bet = state.bets[game_idx, opp_idx]
+        raise_amounts = opp_bet + state.last_raise_amount
+
+        # Step environment
+        new_state = step(state, game_actions, raise_amounts)
+
+        # Get rewards for both players
+        rewards = get_rewards(new_state)
+        rewards_p0 = rewards[:, 0]
+        rewards_p1 = rewards[:, 1]
+
+        # Done flags
+        dones = new_state.done.astype(jnp.float32)
+
+        return (new_state, obs, actions, log_probs, main_values, exp_values,
+                rewards_p0, rewards_p1, dones, valid_mask)
+
     def collect_rollout(
         self,
         num_steps: int,
@@ -742,17 +967,16 @@ class JAXTrainer:
 
             # Track action distribution (only for model's actions in mixed mode)
             if use_mixed:
-                # In mixed mode, actions are 0-indexed from model perspective
+                # Actions are 1-indexed (ACTION_FOLD=1, ACTION_CHECK=2, etc.)
                 # Only count when it was model's turn
                 model_turn = state.current_player == 0
                 for idx, name in action_idx_to_name.items():
-                    # Convert from 0-indexed to 1-indexed for comparison
-                    action_counts[name] += int(((actions == (idx - 1)) & model_turn).sum())
+                    action_counts[name] += int(((actions == idx) & model_turn).sum())
             else:
-                # Self-play: actions are 0-indexed
+                # Self-play: actions are 1-indexed (ACTION_FOLD=1, etc.)
                 actions_np = jnp.asarray(actions)
                 for idx, name in action_idx_to_name.items():
-                    action_counts[name] += int((actions_np == (idx - 1)).sum())
+                    action_counts[name] += int((actions_np == idx).sum())
 
             # Track wins and losses
             done_mask = dones > 0.5
@@ -821,6 +1045,323 @@ class JAXTrainer:
 
         return trajectory, metrics
 
+    def _create_adversarial_scan_fn(self, train_main: bool):
+        """Create JIT-compiled scan function for adversarial rollout.
+
+        Args:
+            train_main: If True, collect from main's perspective; else exploiter's
+
+        Returns:
+            JIT-compiled scan function
+        """
+        network = self.network
+        config = self.training_config
+
+        @jax.jit
+        def scan_step(carry, _):
+            """Single step in adversarial rollout."""
+            state, rng_key, main_params, exp_params = carry
+
+            # Split RNG
+            rng_key, step_key, reset_key = jrandom.split(rng_key, 3)
+
+            # Run core step (both forward passes)
+            (new_state, obs, actions, log_probs, main_values, exp_values,
+             rewards_p0, rewards_p1, dones, valid_mask) = self._adversarial_step_core(
+                network, main_params, exp_params, state, step_key
+            )
+
+            # Select values and rewards based on who is learning
+            is_player0_turn = state.current_player == 0
+            if train_main:
+                # Main is learning: use main's values, p0's rewards, mask for p0's turns
+                values = main_values
+                learner_rewards = rewards_p0
+                learner_mask = is_player0_turn.astype(jnp.float32)
+            else:
+                # Exploiter is learning: use exp's values, p1's rewards, mask for p1's turns
+                values = exp_values
+                learner_rewards = rewards_p1
+                learner_mask = (state.current_player == 1).astype(jnp.float32)
+
+            # Reset completed games
+            fresh_state = reset(
+                reset_key, config.num_parallel_games,
+                config.starting_chips, config.small_blind, config.big_blind
+            )
+
+            def select_state(fresh, old):
+                done_mask = new_state.done
+                for _ in range(old.ndim - 1):
+                    done_mask = done_mask[:, None]
+                return jnp.where(done_mask, fresh, old)
+
+            next_state = jax.tree_util.tree_map(select_state, fresh_state, new_state)
+
+            # Output for this step
+            step_data = (obs, actions, log_probs, values, learner_rewards, dones, valid_mask, learner_mask)
+
+            return (next_state, rng_key, main_params, exp_params), step_data
+
+        return scan_step
+
+    def collect_rollout_adversarial(
+        self,
+        num_steps: int,
+        train_main: bool = True,
+    ) -> tuple[Trajectory, TrainingMetrics]:
+        """Collect rollout for adversarial training (main vs exploiter).
+
+        Uses JIT-compiled jax.lax.scan for fast GPU execution.
+
+        Args:
+            num_steps: Number of steps to collect
+            train_main: If True, collect from main's perspective; else from exploiter's
+
+        Returns:
+            Tuple of (trajectory, metrics)
+        """
+        config = self.training_config
+        n_games = config.num_parallel_games
+
+        # Initialize games
+        self.rng_key, reset_key = jrandom.split(self.rng_key)
+        state = reset(
+            reset_key, n_games,
+            config.starting_chips, config.small_blind, config.big_blind
+        )
+
+        start_time = time.time()
+
+        # Get or create cached scan function
+        cache_key = ("adversarial", train_main)
+        if not hasattr(self, "_adversarial_scan_cache"):
+            self._adversarial_scan_cache = {}
+        if cache_key not in self._adversarial_scan_cache:
+            self._adversarial_scan_cache[cache_key] = self._create_adversarial_scan_fn(train_main)
+        scan_fn = self._adversarial_scan_cache[cache_key]
+
+        # Run scan (fully JIT-compiled loop on GPU)
+        self.rng_key, loop_key = jrandom.split(self.rng_key)
+        carry = (state, loop_key, self.params, self.exploiter_params)
+        _, step_data = jax.lax.scan(scan_fn, carry, None, length=num_steps)
+
+        # Unpack step data
+        all_obs, all_actions, all_log_probs, all_values, all_rewards, all_dones, all_valid_masks, all_learner_masks = step_data
+
+        elapsed = time.time() - start_time
+
+        # Build trajectory
+        trajectory = Trajectory(
+            obs=all_obs,  # [T, N, obs_dim]
+            actions=all_actions,  # [T, N]
+            log_probs=all_log_probs,  # [T, N]
+            values=all_values,  # [T, N]
+            rewards=all_rewards,  # [T, N]
+            dones=all_dones,  # [T, N]
+            valid_masks=all_valid_masks,  # [T, N, 9]
+            model_masks=all_learner_masks,  # [T, N]
+        )
+
+        # Compute metrics (done on CPU after scan completes)
+        total_steps = num_steps * n_games
+        games_completed = int(all_dones.sum())
+        total_rewards = float(all_rewards.sum())
+
+        # Action counts (computed once at end)
+        action_idx_to_name = {
+            1: "fold", 2: "check", 3: "call",
+            4: "raise_33", 5: "raise_66", 6: "raise_100", 7: "raise_150",
+            8: "all_in"
+        }
+        action_counts = {}
+        learner_turns = all_learner_masks > 0.5
+        for idx, name in action_idx_to_name.items():
+            action_counts[name] = int(((all_actions == idx) & learner_turns).sum())
+
+        # Win/loss tracking
+        done_mask = all_dones > 0.5
+        won_games = (all_rewards > 0) & done_mask
+        lost_games = (all_rewards < 0) & done_mask
+        wins = int(won_games.sum())
+        losses = int(lost_games.sum())
+        total_pot_won = float(jnp.where(won_games, all_rewards, 0.0).sum())
+
+        metrics = TrainingMetrics(
+            steps=total_steps,
+            games_completed=games_completed,
+            avg_reward=total_rewards / max(games_completed, 1),
+            avg_game_length=total_steps / max(games_completed, 1),
+            steps_per_second=total_steps / max(elapsed, 0.001),
+            games_per_second=games_completed / max(elapsed, 0.001),
+            wins=wins,
+            losses=losses,
+            total_pot_won=total_pot_won,
+            action_counts=action_counts,
+        )
+
+        return trajectory, metrics
+
+    def _create_adversarial_hybrid_scan_fn(self):
+        """Create JIT-compiled scan function for hybrid adversarial rollout.
+
+        Historical params are passed through the carry to enable caching.
+
+        Returns:
+            JIT-compiled scan function
+        """
+        network = self.network
+        config = self.training_config
+        mix = config.adversarial_historical_mix
+        n_games = config.num_parallel_games
+
+        # Pre-compute which games use historical vs exploiter
+        # First N games use historical, rest use exploiter
+        n_historical = int(n_games * mix)
+        use_historical_mask = jnp.arange(n_games) < n_historical
+
+        @jax.jit
+        def scan_step(carry, _):
+            """Single step in hybrid adversarial rollout."""
+            state, rng_key, main_params, exp_params, hist_params = carry
+
+            # Split RNG
+            rng_key, step_key, reset_key = jrandom.split(rng_key, 3)
+
+            # Run hybrid core step (three forward passes)
+            (new_state, obs, actions, log_probs, main_values, exp_values,
+             rewards_p0, rewards_p1, dones, valid_mask) = self._adversarial_step_core_hybrid(
+                network, main_params, exp_params, hist_params,
+                use_historical_mask, config.fold_dropout_rate, state, step_key
+            )
+
+            # Main is always learning: use main's values, p0's rewards
+            values = main_values
+            learner_rewards = rewards_p0
+            is_player0_turn = state.current_player == 0
+            learner_mask = is_player0_turn.astype(jnp.float32)
+
+            # Reset completed games
+            fresh_state = reset(
+                reset_key, config.num_parallel_games,
+                config.starting_chips, config.small_blind, config.big_blind
+            )
+
+            def select_state(fresh, old):
+                done_mask = new_state.done
+                for _ in range(old.ndim - 1):
+                    done_mask = done_mask[:, None]
+                return jnp.where(done_mask, fresh, old)
+
+            next_state = jax.tree_util.tree_map(select_state, fresh_state, new_state)
+
+            # Output for this step
+            step_data = (obs, actions, log_probs, values, learner_rewards, dones, valid_mask, learner_mask)
+
+            return (next_state, rng_key, main_params, exp_params, hist_params), step_data
+
+        return scan_step
+
+    def collect_rollout_adversarial_hybrid(
+        self,
+        num_steps: int,
+    ) -> tuple[Trajectory, TrainingMetrics]:
+        """Collect rollout for hybrid adversarial training (main vs historical + exploiter).
+
+        Uses JIT-compiled jax.lax.scan for fast GPU execution.
+        50% of games play against historical checkpoints, 50% against exploiter.
+
+        Args:
+            num_steps: Number of steps to collect
+
+        Returns:
+            Tuple of (trajectory, metrics)
+        """
+        config = self.training_config
+        n_games = config.num_parallel_games
+
+        # Sample historical opponent from pool
+        if hasattr(self, 'checkpoint_pool') and len(self.checkpoint_pool.checkpoints) > 0:
+            self.rng_key, sample_key = jrandom.split(self.rng_key)
+            historical_params, _, _ = self.checkpoint_pool.sample_opponent(sample_key)
+        else:
+            # Fallback to self-play if pool is empty
+            historical_params = self.params
+
+        # Initialize games
+        self.rng_key, reset_key = jrandom.split(self.rng_key)
+        state = reset(
+            reset_key, n_games,
+            config.starting_chips, config.small_blind, config.big_blind
+        )
+
+        start_time = time.time()
+
+        # Get or create cached scan function (historical_params passed via carry for caching)
+        if not hasattr(self, "_hybrid_scan_cache"):
+            self._hybrid_scan_cache = self._create_adversarial_hybrid_scan_fn()
+        scan_fn = self._hybrid_scan_cache
+
+        # Run scan (fully JIT-compiled loop on GPU)
+        # Historical params passed through carry to enable JIT caching
+        self.rng_key, loop_key = jrandom.split(self.rng_key)
+        carry = (state, loop_key, self.params, self.exploiter_params, historical_params)
+        _, step_data = jax.lax.scan(scan_fn, carry, None, length=num_steps)
+
+        # Unpack step data
+        all_obs, all_actions, all_log_probs, all_values, all_rewards, all_dones, all_valid_masks, all_learner_masks = step_data
+
+        elapsed = time.time() - start_time
+
+        # Build trajectory
+        trajectory = Trajectory(
+            obs=all_obs,
+            actions=all_actions,
+            log_probs=all_log_probs,
+            values=all_values,
+            rewards=all_rewards,
+            dones=all_dones,
+            valid_masks=all_valid_masks,
+            model_masks=all_learner_masks,
+        )
+
+        # Compute metrics
+        total_steps = num_steps * n_games
+        games_completed = int(all_dones.sum())
+        total_rewards = float(all_rewards.sum())
+
+        action_idx_to_name = {
+            1: "fold", 2: "check", 3: "call",
+            4: "raise_33", 5: "raise_66", 6: "raise_100", 7: "raise_150",
+            8: "all_in"
+        }
+        action_counts = {}
+        learner_turns = all_learner_masks > 0.5
+        for idx, name in action_idx_to_name.items():
+            action_counts[name] = int(((all_actions == idx) & learner_turns).sum())
+
+        done_mask = all_dones > 0.5
+        won_games = (all_rewards > 0) & done_mask
+        lost_games = (all_rewards < 0) & done_mask
+        wins = int(won_games.sum())
+        losses = int(lost_games.sum())
+        total_pot_won = float(jnp.where(won_games, all_rewards, 0.0).sum())
+
+        metrics = TrainingMetrics(
+            steps=total_steps,
+            games_completed=games_completed,
+            avg_reward=total_rewards / max(games_completed, 1),
+            avg_game_length=total_steps / max(games_completed, 1),
+            steps_per_second=total_steps / max(elapsed, 0.001),
+            games_per_second=games_completed / max(elapsed, 0.001),
+            wins=wins,
+            losses=losses,
+            total_pot_won=total_pot_won,
+            action_counts=action_counts,
+        )
+
+        return trajectory, metrics
+
     def train(
         self,
         callback: Callable[[int, TrainingMetrics, PPOMetrics], None] | None = None,
@@ -856,24 +1397,88 @@ class JAXTrainer:
 
         try:
             for update_idx in iterator:
-                # Collect rollout (pass current step for dynamic opponent scheduling)
                 steps_per_game = config.steps_per_update // config.num_parallel_games
-                trajectory, collect_metrics = self.collect_rollout(steps_per_game, current_step=global_step)
 
-                global_step += collect_metrics.steps
-                total_games += collect_metrics.games_completed
+                if config.use_adversarial_training:
+                    # === ADVERSARIAL TRAINING (v4) ===
+                    # Alternating: train main, then train exploiter
 
-                # PPO update
-                self.rng_key, update_key = jrandom.split(self.rng_key)
-                self.params, self.opt_state, ppo_metrics = ppo_update(
-                    self.network,
-                    self.params,
-                    self.opt_state,
-                    self.optimizer,
-                    trajectory,
-                    self.ppo_config,
-                    update_key,
-                )
+                    # Phase A: Train main model vs opponents
+                    if config.adversarial_historical_mix > 0:
+                        # HYBRID MODE: Mix historical + exploiter opponents
+                        trajectory_main, collect_metrics = self.collect_rollout_adversarial_hybrid(
+                            steps_per_game
+                        )
+                    else:
+                        # PURE ADVERSARIAL: Main vs exploiter only
+                        trajectory_main, collect_metrics = self.collect_rollout_adversarial(
+                            steps_per_game, train_main=True
+                        )
+
+                    self.rng_key, update_key = jrandom.split(self.rng_key)
+                    self.params, self.opt_state, ppo_metrics = ppo_update(
+                        self.network,
+                        self.params,
+                        self.opt_state,
+                        self.optimizer,
+                        trajectory_main,
+                        self.ppo_config,
+                        update_key,
+                    )
+
+                    # Phase B: Train exploiter vs frozen main (every N updates)
+                    exp_collect_metrics = None
+                    exp_ppo_metrics = None
+                    if (update_idx + 1) % config.exploiter_update_freq == 0:
+                        trajectory_exp, exp_collect_metrics = self.collect_rollout_adversarial(
+                            steps_per_game, train_main=False
+                        )
+
+                        self.rng_key, exp_update_key = jrandom.split(self.rng_key)
+                        self.exploiter_params, self.exploiter_opt_state, exp_ppo_metrics = ppo_update(
+                            self.network,
+                            self.exploiter_params,
+                            self.exploiter_opt_state,
+                            self.optimizer,
+                            trajectory_exp,
+                            self.ppo_config,
+                            exp_update_key,
+                        )
+
+                    global_step += collect_metrics.steps
+                    total_games += collect_metrics.games_completed
+
+                else:
+                    # === LEGACY TRAINING (v1-v3) ===
+                    # Collect rollout (pass current step for dynamic opponent scheduling)
+                    trajectory, collect_metrics = self.collect_rollout(steps_per_game, current_step=global_step)
+
+                    global_step += collect_metrics.steps
+                    total_games += collect_metrics.games_completed
+
+                    # PPO update
+                    self.rng_key, update_key = jrandom.split(self.rng_key)
+                    self.params, self.opt_state, ppo_metrics = ppo_update(
+                        self.network,
+                        self.params,
+                        self.opt_state,
+                        self.optimizer,
+                        trajectory,
+                        self.ppo_config,
+                        update_key,
+                    )
+
+                # Hybrid adversarial: update checkpoint pool
+                if config.use_adversarial_training and config.adversarial_historical_mix > 0:
+                    if hasattr(self, 'checkpoint_pool') and self.checkpoint_pool:
+                        # Add checkpoint to pool periodically
+                        if global_step > 0 and global_step % config.historical_save_every < config.steps_per_update:
+                            self.checkpoint_pool.add_checkpoint(self.params, global_step)
+                            if self.file_logger:
+                                self.file_logger.info(
+                                    f"  [POOL] Added checkpoint at step {global_step:,} | "
+                                    f"Pool size: {len(self.checkpoint_pool.checkpoints)}"
+                                )
 
                 # Historical self-play: update checkpoint pool and ELO
                 if config.use_historical_selfplay and self.checkpoint_pool:
@@ -961,6 +1566,45 @@ class JAXTrainer:
                         "poker/action_allin": ac["all_in"] / max(total_actions, 1),
                     })
 
+                    # Add exploiter metrics for adversarial training (v4)
+                    if config.use_adversarial_training and exp_collect_metrics is not None and exp_ppo_metrics is not None:
+                        exp_ac = exp_collect_metrics.action_counts
+                        exp_total_actions = sum(exp_ac.values())
+                        exp_decided = exp_collect_metrics.wins + exp_collect_metrics.losses
+                        exp_win_rate = exp_collect_metrics.wins / max(exp_decided, 1)
+                        exp_fold_rate = exp_ac["fold"] / max(exp_total_actions, 1)
+                        exp_raise_count = exp_ac["raise_33"] + exp_ac["raise_66"] + exp_ac["raise_100"] + exp_ac["raise_150"] + exp_ac["all_in"]
+                        exp_call_count = exp_ac["call"]
+                        exp_aggression = exp_raise_count / max(exp_call_count, 1)
+
+                        self.logger.log(global_step, {
+                            # Exploiter rewards
+                            "exploiter/reward_avg": exp_collect_metrics.avg_reward,
+                            # Exploiter loss
+                            "exploiter/loss_policy": exp_ppo_metrics.policy_loss,
+                            "exploiter/loss_value": exp_ppo_metrics.value_loss,
+                            "exploiter/loss_entropy": exp_ppo_metrics.entropy,
+                            # Exploiter PPO diagnostics
+                            "exploiter/ppo_approx_kl": exp_ppo_metrics.approx_kl,
+                            "exploiter/ppo_clip_fraction": exp_ppo_metrics.clip_fraction,
+                            # Exploiter RL diagnostics
+                            "exploiter/explained_variance": exp_ppo_metrics.explained_variance,
+                            "exploiter/grad_norm": exp_ppo_metrics.grad_norm,
+                            # Exploiter poker behavior
+                            "exploiter/win_rate": exp_win_rate,
+                            "exploiter/fold_rate": exp_fold_rate,
+                            "exploiter/aggression": exp_aggression,
+                            # Exploiter action distribution
+                            "exploiter/action_fold": exp_ac["fold"] / max(exp_total_actions, 1),
+                            "exploiter/action_check": exp_ac["check"] / max(exp_total_actions, 1),
+                            "exploiter/action_call": exp_ac["call"] / max(exp_total_actions, 1),
+                            "exploiter/action_raise_33": exp_ac["raise_33"] / max(exp_total_actions, 1),
+                            "exploiter/action_raise_66": exp_ac["raise_66"] / max(exp_total_actions, 1),
+                            "exploiter/action_raise_100": exp_ac["raise_100"] / max(exp_total_actions, 1),
+                            "exploiter/action_raise_150": exp_ac["raise_150"] / max(exp_total_actions, 1),
+                            "exploiter/action_allin": exp_ac["all_in"] / max(exp_total_actions, 1),
+                        })
+
                     # Add ELO metrics for historical self-play (v3.2)
                     if config.use_historical_selfplay and self.checkpoint_pool:
                         pool_stats = self.checkpoint_pool.get_pool_stats()
@@ -983,7 +1627,7 @@ class JAXTrainer:
                         elo_str = f" | elo={self.checkpoint_pool.current_elo:>6.0f}"
 
                     self.file_logger.info(
-                        f"step={global_step:>8} | rew={collect_metrics.avg_reward:>7.3f} | "
+                        f"[MAIN] step={global_step:>8} | rew={collect_metrics.avg_reward:>7.3f} | "
                         f"win={win_rate:>5.1%} | pol={ppo_metrics.policy_loss:>7.4f} | "
                         f"ev={ppo_metrics.explained_variance:>5.2f} | sps={collect_metrics.steps_per_second:>5.0f}{elo_str}"
                     )
@@ -995,6 +1639,22 @@ class JAXTrainer:
                         f"R33={ac['raise_33']:>3} R66={ac['raise_66']:>3} R100={ac['raise_100']:>3} R150={ac['raise_150']:>3} A={ac['all_in']:>4} | "
                         f"games: {collect_metrics.games_completed} done, {collect_metrics.wins}W/{collect_metrics.losses}L"
                     )
+
+                    # Exploiter logging for adversarial training (v4)
+                    if config.use_adversarial_training and exp_collect_metrics is not None and exp_ppo_metrics is not None:
+                        exp_decided = exp_collect_metrics.wins + exp_collect_metrics.losses
+                        exp_win_rate = exp_collect_metrics.wins / max(exp_decided, 1)
+                        self.file_logger.info(
+                            f"[EXPL] step={global_step:>8} | rew={exp_collect_metrics.avg_reward:>7.3f} | "
+                            f"win={exp_win_rate:>5.1%} | pol={exp_ppo_metrics.policy_loss:>7.4f} | "
+                            f"ev={exp_ppo_metrics.explained_variance:>5.2f}"
+                        )
+                        exp_ac = exp_collect_metrics.action_counts
+                        self.file_logger.info(
+                            f"  actions: F={exp_ac['fold']:>4} Ch={exp_ac['check']:>4} Ca={exp_ac['call']:>4} "
+                            f"R33={exp_ac['raise_33']:>3} R66={exp_ac['raise_66']:>3} R100={exp_ac['raise_100']:>3} R150={exp_ac['raise_150']:>3} A={exp_ac['all_in']:>4} | "
+                            f"games: {exp_collect_metrics.games_completed} done, {exp_collect_metrics.wins}W/{exp_collect_metrics.losses}L"
+                        )
 
                 # Checkpointing
                 if global_step % config.checkpoint_every == 0:

@@ -347,6 +347,11 @@ def train_rl_jax(
     mixed_opponents: bool = typer.Option(False, "--mixed-opponents", help="Train against mixed opponents (50%% self, 15%% random, 15%% call_station, 10%% TAG, 10%% LAG)"),
     # Historical self-play (v3.2)
     historical_selfplay: bool = typer.Option(False, "--historical-selfplay", help="Train with historical self-play and ELO tracking (40%% self, 40%% historical, 10%% call_station, 5%% random, 5%% TAG)"),
+    # Adversarial training (v4)
+    adversarial: bool = typer.Option(False, "--adversarial", help="Train with adversarial exploiter (pure co-evolution, no fixed opponents)"),
+    adversarial_checkpoint: Optional[str] = typer.Option(None, "--adversarial-checkpoint", help="Checkpoint to load for main model in adversarial training (exploiter starts random)"),
+    adversarial_mix: float = typer.Option(0.5, "--adversarial-mix", help="Fraction of games vs historical opponents in adversarial mode (0=pure adversarial, 1=pure historical)"),
+    fold_dropout: float = typer.Option(0.05, "--fold-dropout", help="Force fold action this % of time when facing a bet (exploration, 0.05=5%)"),
 ) -> None:
     """Train poker AI using JAX-accelerated PPO (GPU-optimized)."""
     try:
@@ -421,6 +426,10 @@ def train_rl_jax(
         tensorboard_dir=tensorboard,
         use_mixed_opponents=mixed_opponents,
         use_historical_selfplay=historical_selfplay,
+        use_adversarial_training=adversarial,
+        adversarial_main_checkpoint=adversarial_checkpoint,
+        adversarial_historical_mix=adversarial_mix,
+        fold_dropout_rate=fold_dropout,
     )
 
     # Create trainer
@@ -460,6 +469,7 @@ def train_rl_jax(
             "steps_per_second": metrics.steps_per_second,
             "mixed_opponents": mixed_opponents,
             "historical_selfplay": historical_selfplay,
+            "adversarial_training": adversarial,
         },
     )
     save_metadata(model, metadata)
