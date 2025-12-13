@@ -28,7 +28,7 @@ class RewardConfig:
     hand_strength_threshold: float = 0.70  # Threshold for "strong" hands
 
     # Normalization
-    starting_chips: int = 200  # For normalizing chip amounts
+    starting_chips: int = 400  # For normalizing chip amounts (v8: 200BB)
 
 
 @dataclass

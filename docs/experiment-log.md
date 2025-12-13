@@ -4,6 +4,28 @@ Research log tracking model training experiments, results, and lessons learned.
 
 ---
 
+## v8 - 2025-12-13 (IN PROGRESS)
+
+**Summary**: v5-style opponent curriculum + deeper stacks (200BB)
+
+**Hypothesis**: Combining v5's successful baseline-grounded opponent mix with moderate stack depth (200BB vs 100BB) will enable deeper strategic play while maintaining fundamental winning strategies.
+
+**Configuration**:
+- Starting chips: 400 (200BB) - moderate increase from v5's 100BB
+- Opponent mix: Dynamic curriculum (use_dynamic_opponent_schedule=True)
+  - Stage 0: value_bettor 20%, trapper 20%, call_station 15%, self 15%, historical 10%
+  - Stage 600M: self 50%, historical 40%, trapper 5%, value_bettor 5%
+- Rewards: Pure chip delta (no pot-scaling)
+- Training target: 300M steps
+
+**Key difference from v7**: Kept baseline opponents throughout training (v7 used 0% baselines).
+
+**Results**: TBD
+
+**Analysis**: TBD
+
+---
+
 ## v7 - 2025-12-12
 
 **Summary**: Deep stacks (500BB) + pure self-play (no baseline opponents)

@@ -83,7 +83,7 @@ class JAXTrainingConfig:
     tensorboard_dir: str | None = "logs/jax"
 
     # Game settings
-    starting_chips: int = 200
+    starting_chips: int = 400  # 200BB for deeper stack play (v8)
     small_blind: int = 1
     big_blind: int = 2
 
