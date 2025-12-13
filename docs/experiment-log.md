@@ -4,6 +4,55 @@ Research log tracking model training experiments, results, and lessons learned.
 
 ---
 
+## v10 - 2025-12-13
+
+**Summary**: Mixed opponent training with LSTM opponent model
+
+**Hypothesis**: Training the LSTM opponent model against diverse opponents (not just self-play) would enable the model to learn opponent-type discrimination and adapt its strategy accordingly.
+
+**Configuration**:
+- Architecture: ActorCriticMLPWithOpponentModel (same as v9)
+  - OpponentLSTM: 64 hidden, 32 embedding dim
+- Starting chips: 200 (100BB)
+- Training: 100M steps
+- **Mixed Opponent Training**: 50% self, 15% random, 15% call_station, 10% TAG, 10% LAG
+
+**Results** (10,000 games each):
+| Opponent     | Win%  | BB/100  | vs v9 Δ |
+|--------------|-------|---------|---------|
+| random       | 59.0% | +1,039  | -277    |
+| call_station | 31.5% | -1,062  | **+690**|
+| tag          | 82.0% | +382    | -23     |
+| lag          | 55.0% | +331    | -243    |
+| rock         | 82.7% | -241    | **+107**|
+| trapper      | 72.3% | -350    | **+471**|
+| value_bettor | 90.1% | -114    | **+189**|
+
+**Aggregate Performance**:
+- v9 total: -929 BB/100 (across all opponents)
+- v10 total: **-15 BB/100** (nearly break-even!)
+
+**Action Distribution**:
+- Adapts per opponent: 12-16% folds, 5-17% checks
+- More checking vs passive opponents (rock 14%, trapper 17%)
+- Less calling vs call_station (1%) - learned not to chase
+
+**Analysis**:
+1. **Massive improvement vs passive/trapping opponents**: call_station +690, trapper +471, value_bettor +189
+2. **Slight regression vs aggressive opponents**: random -277, lag -243
+3. **Nearly break-even overall** (-15 BB/100) vs v9's -929 BB/100
+4. Mixed training successfully taught the LSTM to distinguish opponent types
+5. The model learned to reduce losses against opponents who trap/call rather than fold
+
+**Lessons Learned**:
+1. **Training diversity is crucial** - exposing LSTM to different playstyles works
+2. Trade-off exists: better vs passive opponents, slightly worse vs aggressive
+3. The 64-dim LSTM is sufficient for basic opponent-type discrimination
+4. Next steps: try curriculum learning (easy opponents first), or larger LSTM for finer adaptation
+5. Consider adding rock/trapper/value_bettor to training mix to further improve
+
+---
+
 ## v9 - 2025-12-13
 
 **Summary**: LSTM-based opponent modeling for cross-hand memory
