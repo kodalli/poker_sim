@@ -46,6 +46,11 @@ class Trajectory(NamedTuple):
     valid_masks: Array  # [T, N, num_actions]
     model_masks: Array | None = None  # [T, N] - 1.0 when model acted, 0.0 on opponent turns (optional for backward compat)
 
+    # === v9 opponent model fields (optional) ===
+    opp_actions: Array | None = None  # [T, N, opp_action_dim] encoded opponent actions
+    lstm_hidden: Array | None = None  # [T, N, lstm_hidden_dim] LSTM hidden states
+    lstm_cell: Array | None = None  # [T, N, lstm_hidden_dim] LSTM cell states
+
 
 class PPOMetrics(NamedTuple):
     """Metrics from PPO update."""
@@ -229,6 +234,156 @@ def ppo_loss(
     )
     # Value prediction error: mean absolute error
     value_pred_error = jnp.abs(returns - values).mean()
+
+    metrics = {
+        "policy_loss": policy_loss,
+        "value_loss": value_loss,
+        "entropy": entropy,
+        "total_loss": total_loss,
+        "approx_kl": approx_kl,
+        "clip_fraction": clip_fraction,
+        "explained_variance": explained_variance,
+        "value_pred_error": value_pred_error,
+    }
+
+    return total_loss, metrics
+
+
+@partial(jax.jit, static_argnums=(0, 10))
+def ppo_loss_sequential(
+    network: nn.Module,
+    params: dict,
+    obs_seq: Array,
+    opp_actions_seq: Array,
+    initial_carry: tuple[Array, Array],
+    actions: Array,
+    old_log_probs: Array,
+    advantages: Array,
+    returns: Array,
+    valid_masks: Array,
+    config: PPOConfig,
+    rng_key: Array,
+    model_masks: Array | None = None,
+) -> tuple[Array, dict]:
+    """Compute PPO loss for sequential data with LSTM unrolling.
+
+    Args:
+        network: Flax network module with opponent model
+        params: Network parameters
+        obs_seq: [seq_len, batch, obs_dim] observation sequence
+        opp_actions_seq: [seq_len, batch, opp_action_dim] opponent action sequence
+        initial_carry: (hidden, cell) LSTM carry at start of sequence
+        actions: [seq_len, batch] action indices
+        old_log_probs: [seq_len, batch] log probabilities from rollout
+        advantages: [seq_len, batch] advantage estimates
+        returns: [seq_len, batch] return estimates
+        valid_masks: [seq_len, batch, num_actions] valid action masks
+        config: PPO config
+        rng_key: PRNG key for dropout
+        model_masks: [seq_len, batch] mask (1.0 = model's turn). If None, all steps used.
+
+    Returns:
+        Tuple of (total_loss, metrics_dict)
+    """
+    seq_len = obs_seq.shape[0]
+
+    def step_fn(carry, inputs):
+        """Single step of LSTM unrolling."""
+        lstm_carry, rng = carry
+        obs_t, opp_action_t = inputs
+
+        # Split RNG for dropout
+        rng, step_rng = jax.random.split(rng)
+
+        # Forward pass through network
+        action_logits, _, values, new_carry = network.apply(
+            {"params": params},
+            obs_t,
+            opp_action_t,
+            lstm_carry,
+            training=True,
+            rngs={"dropout": step_rng},
+        )
+
+        return (new_carry, rng), (action_logits, values)
+
+    # Unroll LSTM through sequence using scan
+    rng_key, unroll_key = jax.random.split(rng_key)
+    _, (action_logits_seq, values_seq) = jax.lax.scan(
+        step_fn,
+        (initial_carry, unroll_key),
+        (obs_seq, opp_actions_seq)
+    )
+
+    # action_logits_seq: [seq_len, batch, num_actions]
+    # values_seq: [seq_len, batch, 1]
+    values_seq = values_seq.squeeze(-1)  # [seq_len, batch]
+
+    # Flatten to [seq_len * batch]
+    batch_size = obs_seq.shape[1]
+    action_logits_flat = action_logits_seq.reshape(-1, action_logits_seq.shape[-1])
+    values_flat = values_seq.reshape(-1)
+    actions_flat = actions.reshape(-1)
+    old_log_probs_flat = old_log_probs.reshape(-1)
+    advantages_flat = advantages.reshape(-1)
+    returns_flat = returns.reshape(-1)
+    valid_masks_flat = valid_masks.reshape(-1, valid_masks.shape[-1])
+
+    # Mask invalid actions
+    masked_logits = jnp.where(valid_masks_flat, action_logits_flat, -1e8)
+
+    # Compute new log probs
+    log_probs = jax.nn.log_softmax(masked_logits, axis=-1)
+    new_log_probs = jnp.take_along_axis(log_probs, actions_flat[:, None], axis=1).squeeze(-1)
+
+    # Compute entropy
+    probs = jax.nn.softmax(masked_logits, axis=-1)
+    safe_log_probs = jnp.log(probs + 1e-10)
+    per_sample_entropy = -jnp.sum(probs * safe_log_probs, axis=-1)
+
+    # PPO policy loss (per sample)
+    ratio = jnp.exp(new_log_probs - old_log_probs_flat)
+    surr1 = ratio * advantages_flat
+    surr2 = jnp.clip(ratio, 1 - config.epsilon, 1 + config.epsilon) * advantages_flat
+    per_sample_policy_loss = -jnp.minimum(surr1, surr2)
+
+    # Value loss (per sample)
+    per_sample_value_loss = (values_flat - returns_flat) ** 2
+
+    # Apply model_masks if provided
+    if model_masks is not None:
+        model_masks_flat = model_masks.reshape(-1)
+        mask_sum = jnp.maximum(model_masks_flat.sum(), 1.0)
+        policy_loss = (per_sample_policy_loss * model_masks_flat).sum() / mask_sum
+        entropy = (per_sample_entropy * model_masks_flat).sum() / mask_sum
+        value_loss = (per_sample_value_loss * model_masks_flat).sum() / mask_sum
+    else:
+        policy_loss = per_sample_policy_loss.mean()
+        entropy = per_sample_entropy.mean()
+        value_loss = per_sample_value_loss.mean()
+
+    # Entropy bonus
+    entropy_loss = -entropy
+
+    # Total loss
+    total_loss = (
+        policy_loss
+        + config.value_coef * value_loss
+        + config.entropy_coef * entropy_loss
+    )
+
+    # Metrics
+    approx_kl = ((ratio - 1) - jnp.log(ratio)).mean()
+    clip_fraction = (jnp.abs(ratio - 1) > config.epsilon).mean()
+
+    # RL diagnostics
+    returns_var = jnp.var(returns_flat)
+    explained_variance = jnp.where(
+        returns_var > 1e-8,
+        1.0 - jnp.var(returns_flat - values_flat) / returns_var,
+        0.0,
+    )
+    value_pred_error = jnp.abs(returns_flat - values_flat).mean()
 
     metrics = {
         "policy_loss": policy_loss,
@@ -440,5 +595,222 @@ def ppo_update(
     # Average metrics and convert to Python floats (only once at the end!)
     num_updates = config.ppo_epochs * config.num_minibatches
     final_metrics = {k: float(v / num_updates) for k, v in metrics_sum.items()}
+
+    return params, opt_state, PPOMetrics(**final_metrics)
+
+
+def ppo_update_sequential(
+    network: nn.Module,
+    params: dict,
+    opt_state: optax.OptState,
+    optimizer: optax.GradientTransformation,
+    trajectory: Trajectory,
+    config: PPOConfig,
+    rng_key: Array,
+    window_size: int = 64,
+) -> tuple[dict, optax.OptState, PPOMetrics]:
+    """PPO update for sequential data with truncated BPTT.
+
+    Splits trajectory into windows, shuffles windows (not individual steps),
+    and unrolls LSTM through each window for gradient computation.
+
+    Args:
+        network: Flax network with opponent model
+        params: Network parameters
+        opt_state: Optimizer state
+        optimizer: Optax optimizer
+        trajectory: Trajectory with v9 fields (opp_actions, lstm_hidden, lstm_cell)
+        config: PPO config
+        rng_key: PRNG key
+        window_size: Truncated BPTT window size (default 64)
+
+    Returns:
+        Tuple of (new_params, new_opt_state, metrics)
+    """
+    T, N = trajectory.rewards.shape
+
+    # Compute GAE
+    advantages, returns = compute_gae(
+        trajectory.rewards,
+        trajectory.values,
+        trajectory.dones,
+        config.gamma,
+        config.lambda_,
+    )
+
+    # Normalize advantages
+    if config.normalize_advantages:
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+    # Truncate to fit window_size
+    n_windows = T // window_size
+
+    # Handle case where trajectory is shorter than window_size
+    if n_windows == 0:
+        # Trajectory too short for BPTT - just use window_size=T
+        window_size = T
+        n_windows = 1
+
+    truncated_T = n_windows * window_size
+
+    # Truncate all trajectory arrays
+    obs_trunc = trajectory.obs[:truncated_T]
+    opp_actions_trunc = trajectory.opp_actions[:truncated_T]
+    lstm_hidden_trunc = trajectory.lstm_hidden[:truncated_T]
+    lstm_cell_trunc = trajectory.lstm_cell[:truncated_T]
+    actions_trunc = trajectory.actions[:truncated_T]
+    log_probs_trunc = trajectory.log_probs[:truncated_T]
+    advantages_trunc = advantages[:truncated_T]
+    returns_trunc = returns[:truncated_T]
+    valid_masks_trunc = trajectory.valid_masks[:truncated_T]
+    model_masks_trunc = trajectory.model_masks[:truncated_T] if trajectory.model_masks is not None else None
+
+    # Reshape into windows: [n_windows, window_size, N, ...]
+    def reshape_to_windows(arr):
+        # arr: [truncated_T, N, ...] or [truncated_T, N]
+        if arr.ndim == 2:
+            # [T, N] -> [n_windows, window_size, N]
+            return arr.reshape(n_windows, window_size, N)
+        else:
+            # [T, N, ...] -> [n_windows, window_size, N, ...]
+            rest_dims = arr.shape[2:]
+            return arr.reshape(n_windows, window_size, N, *rest_dims)
+
+    obs_windows = reshape_to_windows(obs_trunc)
+    opp_actions_windows = reshape_to_windows(opp_actions_trunc)
+    lstm_hidden_windows = reshape_to_windows(lstm_hidden_trunc)
+    lstm_cell_windows = reshape_to_windows(lstm_cell_trunc)
+    actions_windows = reshape_to_windows(actions_trunc)
+    log_probs_windows = reshape_to_windows(log_probs_trunc)
+    advantages_windows = reshape_to_windows(advantages_trunc)
+    returns_windows = reshape_to_windows(returns_trunc)
+    valid_masks_windows = reshape_to_windows(valid_masks_trunc)
+    model_masks_windows = reshape_to_windows(model_masks_trunc) if model_masks_trunc is not None else None
+
+    # For each window, initial carry is lstm state at start (index 0 of window)
+    # [n_windows, N, lstm_hidden_dim]
+    initial_hidden = lstm_hidden_windows[:, 0, :, :]  # [n_windows, N, lstm_hidden_dim]
+    initial_cell = lstm_cell_windows[:, 0, :, :]
+
+    # Flatten windows and games: [n_windows * N]
+    # We'll process each (window, game) pair as a separate sequence
+    batch_size = n_windows * N
+
+    def flatten_window_and_game(arr):
+        # arr: [n_windows, window_size, N, ...] -> [window_size, n_windows * N, ...]
+        # or [n_windows, N, ...] -> [n_windows * N, ...]
+        if arr.ndim == 3:
+            # [n_windows, window_size, N] -> [window_size, n_windows * N]
+            return arr.transpose(1, 0, 2).reshape(window_size, -1)
+        elif arr.ndim == 4:
+            # [n_windows, window_size, N, feature_dim] -> [window_size, n_windows * N, feature_dim]
+            return arr.transpose(1, 0, 2, 3).reshape(window_size, -1, arr.shape[-1])
+        elif arr.ndim == 2:
+            # [n_windows, N, ...] -> [n_windows * N, ...]
+            return arr.reshape(-1, *arr.shape[2:])
+        else:
+            raise ValueError(f"Unexpected ndim: {arr.ndim}")
+
+    # Reshape to [window_size, batch_size, ...]
+    obs_batch = obs_windows.transpose(1, 0, 2, 3).reshape(window_size, batch_size, -1)
+    opp_actions_batch = opp_actions_windows.transpose(1, 0, 2, 3).reshape(window_size, batch_size, -1)
+    actions_batch = actions_windows.transpose(1, 0, 2).reshape(window_size, batch_size)
+    log_probs_batch = log_probs_windows.transpose(1, 0, 2).reshape(window_size, batch_size)
+    advantages_batch = advantages_windows.transpose(1, 0, 2).reshape(window_size, batch_size)
+    returns_batch = returns_windows.transpose(1, 0, 2).reshape(window_size, batch_size)
+    valid_masks_batch = valid_masks_windows.transpose(1, 0, 2, 3).reshape(window_size, batch_size, -1)
+    model_masks_batch = model_masks_windows.transpose(1, 0, 2).reshape(window_size, batch_size) if model_masks_windows is not None else None
+
+    # Initial carry: [n_windows, N, lstm_hidden_dim] -> [batch_size, lstm_hidden_dim]
+    initial_carry = (
+        initial_hidden.reshape(batch_size, -1),
+        initial_cell.reshape(batch_size, -1)
+    )
+
+    # Now we have sequences: [window_size, batch_size, ...]
+    # Run PPO updates with shuffling at batch level (not window level)
+    # We'll do minibatch shuffling across the batch dimension
+
+    # Initialize metrics accumulator
+    init_metrics = {
+        "policy_loss": jnp.array(0.0),
+        "value_loss": jnp.array(0.0),
+        "entropy": jnp.array(0.0),
+        "total_loss": jnp.array(0.0),
+        "approx_kl": jnp.array(0.0),
+        "clip_fraction": jnp.array(0.0),
+        "explained_variance": jnp.array(0.0),
+        "grad_norm": jnp.array(0.0),
+        "value_pred_error": jnp.array(0.0),
+    }
+
+    # For sequential PPO, we can't shuffle individual timesteps
+    # Instead, we shuffle at the batch dimension (different window-game pairs)
+    num_minibatches = config.num_minibatches
+    minibatch_size = batch_size // num_minibatches
+
+    @jax.jit
+    def single_update(carry, inputs):
+        """Single minibatch update."""
+        params, opt_state, rng_key = carry
+        mb_indices = inputs
+
+        # Extract minibatch
+        mb_obs = obs_batch[:, mb_indices, :]
+        mb_opp_actions = opp_actions_batch[:, mb_indices, :]
+        mb_initial_carry = (
+            initial_carry[0][mb_indices, :],
+            initial_carry[1][mb_indices, :]
+        )
+        mb_actions = actions_batch[:, mb_indices]
+        mb_log_probs = log_probs_batch[:, mb_indices]
+        mb_advantages = advantages_batch[:, mb_indices]
+        mb_returns = returns_batch[:, mb_indices]
+        mb_valid_masks = valid_masks_batch[:, mb_indices, :]
+        mb_model_masks = model_masks_batch[:, mb_indices] if model_masks_batch is not None else None
+
+        # Compute loss and gradients
+        rng_key, loss_key = jax.random.split(rng_key)
+        grad_fn = jax.value_and_grad(ppo_loss_sequential, argnums=1, has_aux=True)
+        (loss, metrics), grads = grad_fn(
+            network, params, mb_obs, mb_opp_actions, mb_initial_carry,
+            mb_actions, mb_log_probs, mb_advantages, mb_returns,
+            mb_valid_masks, config, loss_key, mb_model_masks
+        )
+
+        # Compute gradient norm
+        grad_norm = optax.global_norm(grads)
+        metrics["grad_norm"] = grad_norm
+
+        # Update parameters
+        updates, new_opt_state = optimizer.update(grads, opt_state, params)
+        new_params = optax.apply_updates(params, updates)
+
+        return (new_params, new_opt_state, rng_key), metrics
+
+    # Run epochs and minibatches
+    for epoch in range(config.ppo_epochs):
+        # Shuffle batch indices
+        rng_key, shuffle_key = jax.random.split(rng_key)
+        batch_indices = jax.random.permutation(shuffle_key, batch_size)
+
+        # Split into minibatches
+        for mb_idx in range(num_minibatches):
+            start_idx = mb_idx * minibatch_size
+            mb_indices = batch_indices[start_idx:start_idx + minibatch_size]
+
+            # Update
+            rng_key, update_key = jax.random.split(rng_key)
+            (params, opt_state, _), metrics = single_update(
+                (params, opt_state, update_key), mb_indices
+            )
+
+            # Accumulate metrics
+            for k in init_metrics.keys():
+                init_metrics[k] = init_metrics[k] + metrics[k]
+
+    # Average metrics
+    num_updates = config.ppo_epochs * num_minibatches
+    final_metrics = {k: float(v / num_updates) for k, v in init_metrics.items()}
 
     return params, opt_state, PPOMetrics(**final_metrics)

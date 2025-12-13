@@ -288,3 +288,97 @@ def describe_observation(obs: Array) -> dict:
         "to_call": to_call,
         "valid_actions": valid_actions,
     }
+
+
+# === Opponent Action Encoding (v9) ===
+
+OPPONENT_ACTION_DIM = 13  # 9 action types + bet_amount + round + pot_odds + position
+
+
+@jax.jit
+def encode_opponent_action(
+    action_type: Array,
+    bet_amount: Array,
+    round_idx: Array,
+    pot: Array,
+    starting_chips: Array,
+    is_button: Array,
+) -> Array:
+    """Encode opponent action for LSTM input.
+
+    Args:
+        action_type: [N] int action type (0-8)
+        bet_amount: [N] int bet amount in chips
+        round_idx: [N] int round (0=preflop, 1=flop, 2=turn, 3=river)
+        pot: [N] int current pot size
+        starting_chips: [N] int starting chips for normalization
+        is_button: [N] bool whether opponent is button
+
+    Returns:
+        [N, OPPONENT_ACTION_DIM] encoded opponent action features
+    """
+    n_games = action_type.shape[0]
+
+    # One-hot encode action type (9 dims)
+    action_one_hot = jax.nn.one_hot(action_type, NUM_ACTIONS)  # [N, 9]
+
+    # Normalize bet amount
+    bet_norm = (bet_amount / starting_chips.astype(jnp.float32)).clip(0.0, 4.0)[:, None]  # [N, 1]
+
+    # Normalize round (0-1 range)
+    round_norm = (round_idx / 3.0)[:, None]  # [N, 1]
+
+    # Pot odds (bet / pot, clipped)
+    pot_odds = jnp.where(
+        pot > 0,
+        (bet_amount / pot.astype(jnp.float32)).clip(0.0, 4.0),
+        jnp.zeros_like(bet_amount, dtype=jnp.float32),
+    )[:, None]  # [N, 1]
+
+    # Position (button indicator)
+    position = is_button.astype(jnp.float32)[:, None]  # [N, 1]
+
+    # Concatenate: 9 + 1 + 1 + 1 + 1 = 13 dims
+    opp_action_features = jnp.concatenate([
+        action_one_hot,  # 9
+        bet_norm,        # 1
+        round_norm,      # 1
+        pot_odds,        # 1
+        position,        # 1
+    ], axis=1)
+
+    return opp_action_features
+
+
+@jax.jit
+def encode_opponent_action_from_state(
+    state: GameState,
+    action_type: Array,
+    bet_amount: Array,
+    current_player: Array,
+) -> Array:
+    """Encode opponent action using current game state.
+
+    Convenience wrapper that extracts state info for encode_opponent_action.
+
+    Args:
+        state: Current game state
+        action_type: [N] action taken by opponent
+        bet_amount: [N] bet amount by opponent
+        current_player: [N] current player (opponent is 1 - current_player)
+
+    Returns:
+        [N, OPPONENT_ACTION_DIM] encoded opponent action
+    """
+    opp_id = 1 - current_player
+    pot = state.pot + state.bets[:, 0] + state.bets[:, 1]
+    is_button = (state.button == opp_id)
+
+    return encode_opponent_action(
+        action_type=action_type,
+        bet_amount=bet_amount,
+        round_idx=state.round,
+        pot=pot,
+        starting_chips=state.starting_chips,
+        is_button=is_button,
+    )

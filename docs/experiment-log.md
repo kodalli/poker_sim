@@ -4,7 +4,7 @@ Research log tracking model training experiments, results, and lessons learned.
 
 ---
 
-## v8 - 2025-12-13 (IN PROGRESS)
+## v8 - 2025-12-13
 
 **Summary**: v5-style opponent curriculum + deeper stacks (200BB)
 
@@ -14,15 +14,35 @@ Research log tracking model training experiments, results, and lessons learned.
 - Starting chips: 400 (200BB) - moderate increase from v5's 100BB
 - Opponent mix: Dynamic curriculum (use_dynamic_opponent_schedule=True)
   - Stage 0: value_bettor 20%, trapper 20%, call_station 15%, self 15%, historical 10%
-  - Stage 600M: self 50%, historical 40%, trapper 5%, value_bettor 5%
+  - Stage 100M: self 25%, historical 20%, trapper 15%, value_bettor 15%, call_station 10%
+  - Stage 300M: self 40%, historical 30%, trapper 10%, value_bettor 10%, call_station 5%
 - Rewards: Pure chip delta (no pot-scaling)
-- Training target: 300M steps
+- Training: 150M steps (stopped at 97k generations)
 
-**Key difference from v7**: Kept baseline opponents throughout training (v7 used 0% baselines).
+**Results**:
+| Opponent     | Win%  | BB/100  |
+|--------------|-------|---------|
+| random       | 51.9% | -720    |
+| call_station | 23.2% | -3,092  |
+| tag          | 81.6% | -132    |
+| lag          | 47.7% | -1,455  |
+| rock         | 76.8% | -1,081  |
+| trapper      | 62.0% | -1,732  |
+| value_bettor | 86.3% | -489    |
 
-**Results**: TBD
+**Action Distribution**: 0% checks, 43-64% raise_150+all_in (hyper-aggressive)
 
-**Analysis**: TBD
+**Analysis**: Catastrophic failure similar to v7. Model wins pots but hemorrhages chips. The 200BB stacks amplified losses - with deeper stacks, aggressive mistakes cost more. Key symptoms:
+1. Never checks (0%) - missing free cards and pot control
+2. Hyper-aggressive (43-64% large raises/all-ins)
+3. High win% but massive negative BB/100 = winning small pots, losing big ones
+4. Worse than v5 on every metric despite similar curriculum
+
+**Lessons Learned**:
+1. Deeper stacks (200BB vs 100BB) don't work without architecture changes
+2. Stack depth amplifies errors - need better fundamentals first
+3. Model can't learn proper pot odds with current architecture
+4. Consider returning to 100BB, or need opponent modeling to handle deeper play
 
 ---
 

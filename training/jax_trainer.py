@@ -41,18 +41,27 @@ from evaluation.opponents import (
 )
 from poker_jax.network import (
     ActorCriticMLP,
+    ActorCriticMLPWithOpponentModel,
+    OpponentLSTM,
     create_network,
+    OPPONENT_ACTION_DIM,
+    OPPONENT_LSTM_HIDDEN,
     init_network,
     sample_action,
     count_parameters,
 )
-from poker_jax.encoding import OBS_DIM, get_valid_actions_from_obs
+from poker_jax.encoding import (
+    OBS_DIM,
+    get_valid_actions_from_obs,
+    encode_opponent_action_from_state,
+)
 from training.jax_ppo import (
     PPOConfig,
     PPOMetrics,
     Trajectory,
     create_optimizer,
     ppo_update,
+    ppo_update_sequential,
 )
 from training.logging import MetricsLogger
 from training.elo import CheckpointPool, OPPONENT_ELOS, INITIAL_ELO
@@ -151,6 +160,12 @@ class JAXTrainingConfig:
     # Eval checkpoints during training (early detection of degenerate strategies)
     eval_checkpoint_every: int = 0  # Steps between evaluations (0=disabled). Recommended: 10_000_000
     eval_checkpoint_games: int = 2000  # Games per opponent for checkpoint eval
+
+    # === v9 Opponent Modeling ===
+    use_opponent_model: bool = False  # Enable LSTM-based opponent modeling
+    opponent_lstm_hidden: int = 64  # LSTM hidden dimension
+    opponent_embed_dim: int = 32  # Opponent embedding dimension
+    bptt_window_size: int = 64  # Truncated BPTT window size for sequential processing
 
 
 # Opponent type indices for mixed training
@@ -426,12 +441,28 @@ class JAXTrainer:
 
         # Create network
         if network is None:
-            network = create_network("mlp")
+            if self.training_config.use_opponent_model:
+                # v9: Use opponent modeling network
+                network = ActorCriticMLPWithOpponentModel(
+                    opponent_lstm_hidden=self.training_config.opponent_lstm_hidden,
+                    opponent_embed_dim=self.training_config.opponent_embed_dim,
+                )
+            else:
+                network = create_network("mlp")
         self.network = network
 
         # Initialize parameters
         self.rng_key, init_key = jrandom.split(self.rng_key)
-        self.params = init_network(network, init_key, OBS_DIM)
+        if self.training_config.use_opponent_model:
+            # v9: Initialize with opponent action and carry inputs
+            n_games = self.training_config.num_parallel_games
+            dummy_obs = jnp.zeros((1, OBS_DIM))
+            dummy_opp_action = jnp.zeros((1, OPPONENT_ACTION_DIM))
+            dummy_carry = OpponentLSTM.init_carry(1, self.training_config.opponent_lstm_hidden)
+            variables = network.init(init_key, dummy_obs, dummy_opp_action, dummy_carry, training=False)
+            self.params = variables["params"]
+        else:
+            self.params = init_network(network, init_key, OBS_DIM)
 
         # Create optimizer
         self.optimizer = create_optimizer(self.ppo_config)
@@ -529,17 +560,28 @@ class JAXTrainer:
             self.console.print(f"  Save every: {self.training_config.historical_save_every:,} steps")
 
     @staticmethod
-    @partial(jax.jit, static_argnums=(0,))
+    @partial(jax.jit, static_argnums=(0, 5))
     def _collect_step(
-        network: ActorCriticMLP,
+        network: ActorCriticMLP | ActorCriticMLPWithOpponentModel,
         params: dict,
         state: GameState,
         rng_key: Array,
-    ) -> tuple[GameState, Array, Array, Array, Array, Array, Array]:
+        opp_action: Array,
+        use_opponent_model: bool = False,
+    ) -> tuple[GameState, Array, Array, Array, Array, Array, Array, Array, tuple[Array, Array] | None]:
         """Collect one step of experience from all parallel games.
 
+        Args:
+            network: Network (ActorCriticMLP or ActorCriticMLPWithOpponentModel)
+            params: Network parameters
+            state: Current game state
+            rng_key: PRNG key
+            opp_action: [N, OPPONENT_ACTION_DIM] last opponent action encoding
+            use_opponent_model: Static flag - if True, network expects opponent model inputs
+
         Returns:
-            Tuple of (new_state, obs, actions, log_probs, values, rewards, dones)
+            Tuple of (new_state, obs, actions, log_probs, values, rewards, dones, valid_mask, new_carry)
+            new_carry is None if not using opponent model
         """
         n_games = state.done.shape[0]
 
@@ -549,10 +591,20 @@ class JAXTrainer:
         # Get valid actions
         valid_mask = get_valid_actions_from_obs(obs)  # [N, 9] (includes ACTION_NONE at index 0)
 
-        # Forward pass
-        action_logits, bet_frac, values = network.apply(
-            {"params": params}, obs, training=False
-        )
+        # Forward pass (conditional on use_opponent_model)
+        if use_opponent_model:
+            # v9: Use opponent modeling network
+            lstm_carry = (state.opp_lstm_hidden, state.opp_lstm_cell)
+            action_logits, bet_frac, values, new_carry = network.apply(
+                {"params": params}, obs, opp_action, lstm_carry, training=False
+            )
+        else:
+            # Standard network
+            action_logits, bet_frac, values = network.apply(
+                {"params": params}, obs, training=False
+            )
+            new_carry = None
+
         values = values.squeeze(-1)
 
         # Sample actions
@@ -580,7 +632,7 @@ class JAXTrainer:
         # Done flags
         dones = new_state.done.astype(jnp.float32)
 
-        return new_state, obs, actions, log_probs, values, player_rewards, dones, valid_mask
+        return new_state, obs, actions, log_probs, values, player_rewards, dones, valid_mask, new_carry
 
     @staticmethod
     @partial(jax.jit, static_argnums=(0, 6))
@@ -905,6 +957,11 @@ class JAXTrainer:
         all_valid_masks = []
         all_model_masks = []  # v3.6: Track which steps are model's turns (for mixed opponent training)
 
+        # v9: Opponent model storage (only used if use_opponent_model=True)
+        all_opp_actions = []
+        all_lstm_hidden = []
+        all_lstm_cell = []
+
         total_rewards = 0.0
         games_completed = 0
         total_game_steps = 0
@@ -969,10 +1026,18 @@ class JAXTrainer:
                 # Mixed/historical opponent mode: model is player 0, opponents are player 1
                 new_state, obs, actions, log_probs, values, rewards, dones, valid_mask, model_mask = \
                     self._collect_step_mixed(self.network, self.params, state, opponent_types, step_key, historical_params, use_different_historical)
+                new_carry = None  # v9 not supported for mixed opponents yet
             else:
                 # Self-play mode: both players use network (all turns are "model" turns)
-                new_state, obs, actions, log_probs, values, rewards, dones, valid_mask = \
-                    self._collect_step(self.network, self.params, state, step_key)
+                if config.use_opponent_model:
+                    # v9: Pass opponent action and LSTM carry
+                    new_state, obs, actions, log_probs, values, rewards, dones, valid_mask, new_carry = \
+                        self._collect_step(self.network, self.params, state, step_key, state.last_opp_action, use_opponent_model=True)
+                else:
+                    # Legacy: no opponent modeling
+                    opp_action_dummy = jnp.zeros((n_games, OPPONENT_ACTION_DIM))
+                    new_state, obs, actions, log_probs, values, rewards, dones, valid_mask, new_carry = \
+                        self._collect_step(self.network, self.params, state, step_key, opp_action_dummy, use_opponent_model=False)
                 model_mask = jnp.ones(n_games, dtype=jnp.float32)  # All turns count in self-play
 
             # Store
@@ -984,6 +1049,53 @@ class JAXTrainer:
             all_dones.append(dones)
             all_valid_masks.append(valid_mask)
             all_model_masks.append(model_mask)  # v3.6: Store model turn mask
+
+            # v9: Store LSTM carry and opponent actions
+            if config.use_opponent_model and new_carry is not None:
+                all_lstm_hidden.append(state.opp_lstm_hidden)  # Store carry BEFORE update
+                all_lstm_cell.append(state.opp_lstm_cell)
+                all_opp_actions.append(state.last_opp_action)
+
+                # Update LSTM carry in state (new_carry from forward pass)
+                # This happens when MODEL acts, so we update the carry
+                state = state._replace(
+                    opp_lstm_hidden=new_carry[0],
+                    opp_lstm_cell=new_carry[1],
+                )
+
+            # v9: After step, if opponent acted, encode their action
+            if config.use_opponent_model and not use_mixed:
+                # Determine who just acted by comparing current_player before/after step
+                # If current_player changed, opponent just acted
+                opponent_acted = new_state.current_player != state.current_player
+
+                # Get opponent's action (the action that was just taken)
+                # game_actions is 1-indexed, convert to 0-indexed for encoding
+                opp_action_type = jnp.where(
+                    opponent_acted,
+                    actions,  # actions is 0-indexed from sample_action
+                    jnp.zeros_like(actions)
+                )
+
+                # Get opponent's bet amount
+                # After step, new_state has the updated bets
+                opp_idx = 1 - state.current_player
+                game_idx = jnp.arange(n_games)
+                opp_bet_amount = new_state.bets[game_idx, opp_idx]
+
+                # Encode opponent action
+                encoded_opp_action = encode_opponent_action_from_state(
+                    new_state, opp_action_type, opp_bet_amount, state.current_player
+                )
+
+                # Update state.last_opp_action where opponent acted
+                new_state = new_state._replace(
+                    last_opp_action=jnp.where(
+                        opponent_acted[:, None],
+                        encoded_opp_action,
+                        new_state.last_opp_action
+                    )
+                )
 
             # Track metrics
             completed = dones.sum()
@@ -1042,16 +1154,34 @@ class JAXTrainer:
         elapsed = time.time() - start_time
 
         # Stack trajectory
-        trajectory = Trajectory(
-            obs=jnp.stack(all_obs),  # [T, N, obs_dim]
-            actions=jnp.stack(all_actions),  # [T, N]
-            log_probs=jnp.stack(all_log_probs),  # [T, N]
-            values=jnp.stack(all_values),  # [T, N]
-            rewards=jnp.stack(all_rewards),  # [T, N]
-            dones=jnp.stack(all_dones),  # [T, N]
-            valid_masks=jnp.stack(all_valid_masks),  # [T, N, 9]
-            model_masks=jnp.stack(all_model_masks),  # [T, N] - v3.6: 1.0 when model acted, 0.0 on opponent turns
-        )
+        # v9: Include opponent model fields if enabled
+        if config.use_opponent_model and len(all_opp_actions) > 0:
+            trajectory = Trajectory(
+                obs=jnp.stack(all_obs),  # [T, N, obs_dim]
+                actions=jnp.stack(all_actions),  # [T, N]
+                log_probs=jnp.stack(all_log_probs),  # [T, N]
+                values=jnp.stack(all_values),  # [T, N]
+                rewards=jnp.stack(all_rewards),  # [T, N]
+                dones=jnp.stack(all_dones),  # [T, N]
+                valid_masks=jnp.stack(all_valid_masks),  # [T, N, 9]
+                model_masks=jnp.stack(all_model_masks),  # [T, N] - v3.6: 1.0 when model acted, 0.0 on opponent turns
+                # v9 fields
+                opp_actions=jnp.stack(all_opp_actions),  # [T, N, OPPONENT_ACTION_DIM]
+                lstm_hidden=jnp.stack(all_lstm_hidden),  # [T, N, lstm_hidden_dim]
+                lstm_cell=jnp.stack(all_lstm_cell),  # [T, N, lstm_hidden_dim]
+            )
+        else:
+            # Legacy trajectory (no opponent model)
+            trajectory = Trajectory(
+                obs=jnp.stack(all_obs),  # [T, N, obs_dim]
+                actions=jnp.stack(all_actions),  # [T, N]
+                log_probs=jnp.stack(all_log_probs),  # [T, N]
+                values=jnp.stack(all_values),  # [T, N]
+                rewards=jnp.stack(all_rewards),  # [T, N]
+                dones=jnp.stack(all_dones),  # [T, N]
+                valid_masks=jnp.stack(all_valid_masks),  # [T, N, 9]
+                model_masks=jnp.stack(all_model_masks),  # [T, N] - v3.6: 1.0 when model acted, 0.0 on opponent turns
+            )
 
         # Compute metrics
         total_steps = num_steps * n_games
@@ -1600,15 +1730,30 @@ class JAXTrainer:
 
                     # PPO update
                     self.rng_key, update_key = jrandom.split(self.rng_key)
-                    self.params, self.opt_state, ppo_metrics = ppo_update(
-                        self.network,
-                        self.params,
-                        self.opt_state,
-                        self.optimizer,
-                        trajectory,
-                        self.ppo_config,
-                        update_key,
-                    )
+
+                    # v9: Use sequential PPO if opponent modeling is enabled
+                    if config.use_opponent_model:
+                        self.params, self.opt_state, ppo_metrics = ppo_update_sequential(
+                            self.network,
+                            self.params,
+                            self.opt_state,
+                            self.optimizer,
+                            trajectory,
+                            self.ppo_config,
+                            update_key,
+                            window_size=config.bptt_window_size,
+                        )
+                    else:
+                        # Standard PPO (no LSTM)
+                        self.params, self.opt_state, ppo_metrics = ppo_update(
+                            self.network,
+                            self.params,
+                            self.opt_state,
+                            self.optimizer,
+                            trajectory,
+                            self.ppo_config,
+                            update_key,
+                        )
 
                 # Hybrid adversarial: update checkpoint pool
                 if config.use_adversarial_training and config.adversarial_historical_mix > 0:

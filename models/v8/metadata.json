@@ -1,0 +1,19 @@
+{
+  "version": "v8",
+  "architecture": "actor_critic_jax",
+  "generations": 97656,
+  "population_size": 1536,
+  "best_fitness": 0.0,
+  "created": "2025-12-13T00:47:55.737324",
+  "description": "v8: dynamic schedule + 200BB",
+  "config": {
+    "learning_rate": 0.0003,
+    "total_steps": 300000000,
+    "parallel_games": 1536,
+    "training_method": "ppo_jax",
+    "steps_per_second": 147038.3208197827,
+    "mixed_opponents": false,
+    "historical_selfplay": true,
+    "adversarial_training": false
+  }
+}

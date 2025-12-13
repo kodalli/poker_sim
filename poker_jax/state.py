@@ -86,6 +86,13 @@ class GameState(NamedTuple):
     action_history: Array  # [N, 10, 3]
     history_len: Array  # [N] number of actions recorded this hand
 
+    # === Opponent model LSTM state (v9) ===
+    # LSTM hidden/cell states for learned opponent modeling
+    # Persists across hands to build opponent profile
+    opp_lstm_hidden: Array  # [N, OPPONENT_LSTM_HIDDEN]
+    opp_lstm_cell: Array  # [N, OPPONENT_LSTM_HIDDEN]
+    last_opp_action: Array  # [N, OPPONENT_ACTION_DIM] last opponent action features
+
 
 # Action constants
 ACTION_NONE = 0
@@ -105,6 +112,10 @@ NUM_ACTIONS = 9  # Total action count for network output
 
 # Action history constants
 MAX_HISTORY = 10  # Track last 10 actions
+
+# Opponent model constants (v9)
+OPPONENT_LSTM_HIDDEN = 64  # LSTM hidden dimension
+OPPONENT_ACTION_DIM = 13  # 9 action types + bet_amount + round + pot_odds + position
 
 # Round constants
 ROUND_PREFLOP = 0
@@ -171,6 +182,10 @@ def create_initial_state(
         # Action history (v3)
         action_history=jnp.zeros((n_games, MAX_HISTORY, 3), dtype=jnp.float32),
         history_len=jnp.zeros(n_games, dtype=jnp.int32),
+        # Opponent model LSTM state (v9)
+        opp_lstm_hidden=jnp.zeros((n_games, OPPONENT_LSTM_HIDDEN), dtype=jnp.float32),
+        opp_lstm_cell=jnp.zeros((n_games, OPPONENT_LSTM_HIDDEN), dtype=jnp.float32),
+        last_opp_action=jnp.zeros((n_games, OPPONENT_ACTION_DIM), dtype=jnp.float32),
     )
 
 

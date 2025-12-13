@@ -455,7 +455,6 @@ def train_rl_jax(
     # Resume from checkpoint if specified
     start_step = 0
     if resume:
-        from pathlib import Path
         resume_path = Path(resume)
         if not resume_path.exists():
             console.print(f"[red]Checkpoint not found: {resume}[/red]")

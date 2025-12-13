@@ -65,6 +65,128 @@ class ActorCriticMLP(nn.Module):
         return action_logits, bet_fraction, value
 
 
+# Constants for opponent model
+OPPONENT_LSTM_HIDDEN = 64
+OPPONENT_EMBED_DIM = 32
+OPPONENT_ACTION_DIM = 13  # 9 action types one-hot + bet_amount + round + pot_odds + position
+
+
+class OpponentLSTM(nn.Module):
+    """LSTM that builds opponent model from observed actions.
+
+    Maintains a hidden state that persists across hands, building up a
+    representation of the opponent's playing style over time.
+
+    v9 addition for learned opponent modeling.
+    """
+
+    hidden_dim: int = OPPONENT_LSTM_HIDDEN
+    embed_dim: int = OPPONENT_EMBED_DIM
+
+    @nn.compact
+    def __call__(
+        self, action_features: Array, carry: tuple[Array, Array]
+    ) -> tuple[Array, tuple[Array, Array]]:
+        """Update opponent model with new action observation.
+
+        Args:
+            action_features: [batch, OPPONENT_ACTION_DIM] encoded opponent action
+            carry: (hidden, cell) tuple from previous step, each [batch, hidden_dim]
+
+        Returns:
+            opp_embed: [batch, embed_dim] opponent embedding for policy conditioning
+            new_carry: (new_hidden, new_cell) for next step
+        """
+        # LSTM update
+        new_carry, _ = nn.LSTMCell(features=self.hidden_dim)(carry, action_features)
+
+        # Project hidden state to embedding
+        opp_embed = nn.Dense(self.embed_dim, name="opp_embed_proj")(new_carry[0])
+
+        return opp_embed, new_carry
+
+    @staticmethod
+    def init_carry(batch_size: int, hidden_dim: int = OPPONENT_LSTM_HIDDEN) -> tuple[Array, Array]:
+        """Initialize LSTM carry state to zeros."""
+        return (
+            jnp.zeros((batch_size, hidden_dim)),
+            jnp.zeros((batch_size, hidden_dim)),
+        )
+
+
+class ActorCriticMLPWithOpponentModel(nn.Module):
+    """Actor-critic with learned opponent modeling.
+
+    Extends ActorCriticMLP with an OpponentLSTM that encodes opponent behavior
+    into a latent embedding. The embedding is concatenated with observations
+    before the policy backbone.
+
+    v9: Adds cross-hand memory for opponent modeling.
+    """
+
+    hidden_dims: Sequence[int] = (512, 256, 128)
+    num_actions: int = 9
+    dropout_rate: float = 0.1
+    opponent_lstm_hidden: int = OPPONENT_LSTM_HIDDEN
+    opponent_embed_dim: int = OPPONENT_EMBED_DIM
+
+    @nn.compact
+    def __call__(
+        self,
+        obs: Array,
+        opp_action: Array,
+        lstm_carry: tuple[Array, Array],
+        training: bool = True,
+    ) -> tuple[Array, Array, Array, tuple[Array, Array]]:
+        """Forward pass with opponent modeling.
+
+        Args:
+            obs: [batch, OBS_DIM] observations
+            opp_action: [batch, OPPONENT_ACTION_DIM] encoded last opponent action
+                        (zeros if no opponent action yet this hand)
+            lstm_carry: (hidden, cell) tuple for opponent LSTM
+            training: Whether in training mode
+
+        Returns:
+            action_logits: [batch, 9] action logits
+            bet_fraction: [batch, 1] bet sizing
+            value: [batch, 1] state value
+            new_carry: Updated LSTM carry for next step
+        """
+        # Update opponent model
+        opp_lstm = OpponentLSTM(
+            hidden_dim=self.opponent_lstm_hidden,
+            embed_dim=self.opponent_embed_dim,
+        )
+        opp_embed, new_carry = opp_lstm(opp_action, lstm_carry)
+
+        # Concatenate opponent embedding with observation
+        x = jnp.concatenate([obs, opp_embed], axis=-1)
+
+        # Shared backbone (same as ActorCriticMLP)
+        for dim in self.hidden_dims:
+            x = nn.Dense(dim)(x)
+            x = nn.LayerNorm()(x)
+            x = nn.relu(x)
+            x = nn.Dropout(rate=self.dropout_rate, deterministic=not training)(x)
+
+        # Actor head - action logits
+        action_logits = nn.Dense(self.num_actions, name="action_head")(x)
+
+        # Actor head - bet fraction
+        bet_hidden = nn.Dense(32)(x)
+        bet_hidden = nn.relu(bet_hidden)
+        bet_fraction = nn.Dense(1)(bet_hidden)
+        bet_fraction = nn.sigmoid(bet_fraction)
+
+        # Critic head - value
+        value_hidden = nn.Dense(64)(x)
+        value_hidden = nn.relu(value_hidden)
+        value = nn.Dense(1, name="value_head")(value_hidden)
+
+        return action_logits, bet_fraction, value, new_carry
+
+
 class ActorCriticTransformer(nn.Module):
     """Transformer-based actor-critic for poker.
 
