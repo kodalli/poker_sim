@@ -360,6 +360,8 @@ def train_rl_jax(
     eval_games: int = typer.Option(2000, "--eval-games", help="Games per opponent for eval checkpoint (default 2000)"),
     # Resume from checkpoint
     resume: Optional[str] = typer.Option(None, "--resume", "-r", help="Resume from checkpoint file (e.g., models/v7/checkpoints/step_09600000.pkl)"),
+    # v9 opponent model
+    opponent_model: bool = typer.Option(False, "--opponent-model", help="Enable learned opponent modeling with LSTM (v9)"),
 ) -> None:
     """Train poker AI using JAX-accelerated PPO (GPU-optimized)."""
     try:
@@ -442,6 +444,7 @@ def train_rl_jax(
         fold_dropout_rate=fold_dropout,
         eval_checkpoint_every=eval_every,
         eval_checkpoint_games=eval_games,
+        use_opponent_model=opponent_model,
     )
 
     # Create trainer
@@ -493,6 +496,7 @@ def train_rl_jax(
             "mixed_opponents": mixed_opponents,
             "historical_selfplay": historical_selfplay,
             "adversarial_training": adversarial,
+            "opponent_model": opponent_model,
         },
     )
     save_metadata(model, metadata)

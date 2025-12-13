@@ -509,6 +509,92 @@ def _create_ppo_epoch_fn(network, optimizer, config, use_model_masks=False):
 _epoch_fn_cache = {}
 
 
+def _create_ppo_sequential_epoch_fn(network, optimizer, config, window_size, use_model_masks=False):
+    """Create JIT-compiled epoch function for sequential PPO updates with LSTM.
+
+    This is separated to allow JIT compilation with static arguments.
+    The data arrays are passed through the carry to allow caching.
+    """
+    num_minibatches = config.num_minibatches
+
+    @jax.jit
+    def single_epoch(carry, _):
+        """Process one epoch of minibatch updates."""
+        params, opt_state, metrics_sum, rng_key, data = carry
+
+        # Unpack data tuple
+        (obs_batch, opp_actions_batch, initial_carry_h, initial_carry_c,
+         actions_batch, log_probs_batch, advantages_batch, returns_batch,
+         valid_masks_batch, model_masks_batch) = data
+
+        initial_carry = (initial_carry_h, initial_carry_c)
+        batch_size = obs_batch.shape[1]
+        minibatch_size = batch_size // num_minibatches
+
+        # Shuffle indices for this epoch
+        rng_key, shuffle_key = jax.random.split(rng_key)
+        indices = jax.random.permutation(shuffle_key, batch_size)
+
+        def single_minibatch(mb_carry, mb_idx):
+            """Process one minibatch update."""
+            params, opt_state, metrics_sum, rng_key = mb_carry
+
+            # Get minibatch indices using dynamic_slice
+            start = mb_idx * minibatch_size
+            mb_indices = jax.lax.dynamic_slice(indices, [start], [minibatch_size])
+
+            # Extract minibatch data
+            mb_obs = obs_batch[:, mb_indices, :]
+            mb_opp_actions = opp_actions_batch[:, mb_indices, :]
+            mb_initial_carry = (
+                initial_carry[0][mb_indices, :],
+                initial_carry[1][mb_indices, :]
+            )
+            mb_actions = actions_batch[:, mb_indices]
+            mb_log_probs = log_probs_batch[:, mb_indices]
+            mb_advantages = advantages_batch[:, mb_indices]
+            mb_returns = returns_batch[:, mb_indices]
+            mb_valid_masks = valid_masks_batch[:, mb_indices, :]
+            mb_model_masks = model_masks_batch[:, mb_indices] if use_model_masks else None
+
+            # Compute loss and gradients
+            rng_key, loss_key = jax.random.split(rng_key)
+            grad_fn = jax.value_and_grad(ppo_loss_sequential, argnums=1, has_aux=True)
+            (loss, metrics), grads = grad_fn(
+                network, params, mb_obs, mb_opp_actions, mb_initial_carry,
+                mb_actions, mb_log_probs, mb_advantages, mb_returns,
+                mb_valid_masks, config, loss_key, mb_model_masks
+            )
+
+            # Compute gradient norm
+            grad_norm = optax.global_norm(grads)
+            metrics["grad_norm"] = grad_norm
+
+            # Update parameters
+            updates, new_opt_state = optimizer.update(grads, opt_state, params)
+            new_params = optax.apply_updates(params, updates)
+
+            # Accumulate metrics (keep as JAX arrays, no float() conversion!)
+            new_metrics_sum = {k: metrics_sum[k] + metrics[k] for k in metrics_sum.keys()}
+
+            return (new_params, new_opt_state, new_metrics_sum, rng_key), None
+
+        # Process all minibatches in this epoch
+        (params, opt_state, metrics_sum, rng_key), _ = jax.lax.scan(
+            single_minibatch,
+            (params, opt_state, metrics_sum, rng_key),
+            jnp.arange(num_minibatches)
+        )
+
+        return (params, opt_state, metrics_sum, rng_key, data), None
+
+    return single_epoch
+
+
+# Separate cache for sequential epoch functions
+_sequential_epoch_fn_cache = {}
+
+
 def ppo_update(
     network: nn.Module,
     params: dict,
@@ -731,7 +817,7 @@ def ppo_update_sequential(
     # Run PPO updates with shuffling at batch level (not window level)
     # We'll do minibatch shuffling across the batch dimension
 
-    # Initialize metrics accumulator
+    # Initialize metrics accumulator (JAX arrays)
     init_metrics = {
         "policy_loss": jnp.array(0.0),
         "value_loss": jnp.array(0.0),
@@ -744,73 +830,35 @@ def ppo_update_sequential(
         "value_pred_error": jnp.array(0.0),
     }
 
-    # For sequential PPO, we can't shuffle individual timesteps
-    # Instead, we shuffle at the batch dimension (different window-game pairs)
-    num_minibatches = config.num_minibatches
-    minibatch_size = batch_size // num_minibatches
+    # Check if we need model_masks
+    use_model_masks = model_masks_batch is not None
 
-    @jax.jit
-    def single_update(carry, inputs):
-        """Single minibatch update."""
-        params, opt_state, rng_key = carry
-        mb_indices = inputs
+    # Pack data into tuple for carry (enables JIT caching)
+    # Use zeros if model_masks is None to maintain consistent pytree structure
+    model_masks_for_data = model_masks_batch if use_model_masks else jnp.zeros_like(actions_batch)
+    data = (
+        obs_batch, opp_actions_batch, initial_carry[0], initial_carry[1],
+        actions_batch, log_probs_batch, advantages_batch, returns_batch,
+        valid_masks_batch, model_masks_for_data
+    )
 
-        # Extract minibatch
-        mb_obs = obs_batch[:, mb_indices, :]
-        mb_opp_actions = opp_actions_batch[:, mb_indices, :]
-        mb_initial_carry = (
-            initial_carry[0][mb_indices, :],
-            initial_carry[1][mb_indices, :]
+    # Get or create cached epoch function
+    cache_key = (id(network), id(optimizer), config.num_minibatches, window_size, use_model_masks)
+    if cache_key not in _sequential_epoch_fn_cache:
+        _sequential_epoch_fn_cache[cache_key] = _create_ppo_sequential_epoch_fn(
+            network, optimizer, config, window_size, use_model_masks
         )
-        mb_actions = actions_batch[:, mb_indices]
-        mb_log_probs = log_probs_batch[:, mb_indices]
-        mb_advantages = advantages_batch[:, mb_indices]
-        mb_returns = returns_batch[:, mb_indices]
-        mb_valid_masks = valid_masks_batch[:, mb_indices, :]
-        mb_model_masks = model_masks_batch[:, mb_indices] if model_masks_batch is not None else None
+    epoch_fn = _sequential_epoch_fn_cache[cache_key]
 
-        # Compute loss and gradients
-        rng_key, loss_key = jax.random.split(rng_key)
-        grad_fn = jax.value_and_grad(ppo_loss_sequential, argnums=1, has_aux=True)
-        (loss, metrics), grads = grad_fn(
-            network, params, mb_obs, mb_opp_actions, mb_initial_carry,
-            mb_actions, mb_log_probs, mb_advantages, mb_returns,
-            mb_valid_masks, config, loss_key, mb_model_masks
-        )
+    # Run all epochs using scan (fully on GPU)
+    (params, opt_state, metrics_sum, _, _), _ = jax.lax.scan(
+        epoch_fn,
+        (params, opt_state, init_metrics, rng_key, data),
+        jnp.arange(config.ppo_epochs)
+    )
 
-        # Compute gradient norm
-        grad_norm = optax.global_norm(grads)
-        metrics["grad_norm"] = grad_norm
-
-        # Update parameters
-        updates, new_opt_state = optimizer.update(grads, opt_state, params)
-        new_params = optax.apply_updates(params, updates)
-
-        return (new_params, new_opt_state, rng_key), metrics
-
-    # Run epochs and minibatches
-    for epoch in range(config.ppo_epochs):
-        # Shuffle batch indices
-        rng_key, shuffle_key = jax.random.split(rng_key)
-        batch_indices = jax.random.permutation(shuffle_key, batch_size)
-
-        # Split into minibatches
-        for mb_idx in range(num_minibatches):
-            start_idx = mb_idx * minibatch_size
-            mb_indices = batch_indices[start_idx:start_idx + minibatch_size]
-
-            # Update
-            rng_key, update_key = jax.random.split(rng_key)
-            (params, opt_state, _), metrics = single_update(
-                (params, opt_state, update_key), mb_indices
-            )
-
-            # Accumulate metrics
-            for k in init_metrics.keys():
-                init_metrics[k] = init_metrics[k] + metrics[k]
-
-    # Average metrics
-    num_updates = config.ppo_epochs * num_minibatches
-    final_metrics = {k: float(v / num_updates) for k, v in init_metrics.items()}
+    # Average metrics and convert to Python floats (only once at the end!)
+    num_updates = config.ppo_epochs * config.num_minibatches
+    final_metrics = {k: float(v / num_updates) for k, v in metrics_sum.items()}
 
     return params, opt_state, PPOMetrics(**final_metrics)
