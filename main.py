@@ -344,7 +344,7 @@ def train_rl_jax(
     steps_per_update: Optional[int] = typer.Option(None, "--steps-per-update", help="Steps between PPO updates (auto-computed if not set)"),
     ppo_epochs: int = typer.Option(4, "--ppo-epochs", help="PPO epochs per update"),
     # Mixed opponent training (v3.1)
-    mixed_opponents: bool = typer.Option(False, "--mixed-opponents", help="Train against mixed opponents (50%% self, 15%% random, 15%% call_station, 10%% TAG, 10%% LAG)"),
+    mixed_opponents: bool = typer.Option(False, "--mixed-opponents", help="Train against all opponent types (40%% self, 10%% each: random/call_station/tag/lag, 7%% rock/trapper, 6%% value_bettor)"),
     # Historical self-play (v3.2)
     historical_selfplay: bool = typer.Option(False, "--historical-selfplay", help="Train with historical self-play and ELO tracking (40%% self, 40%% historical, 10%% call_station, 5%% random, 5%% TAG)"),
     # Adversarial training (v4)

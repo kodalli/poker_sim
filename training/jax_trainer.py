@@ -96,14 +96,17 @@ class JAXTrainingConfig:
     small_blind: int = 1
     big_blind: int = 2
 
-    # Mixed opponent training (v3.1)
+    # Mixed opponent training (v3.1, updated v11)
     use_mixed_opponents: bool = False
     opponent_mix: dict = field(default_factory=lambda: {
-        "self": 0.50,       # 50% self-play
-        "random": 0.15,     # 15% random
-        "call_station": 0.15,  # 15% call station
-        "tag": 0.10,        # 10% tight-aggressive
-        "lag": 0.10,        # 10% loose-aggressive
+        "self": 0.40,           # 40% self-play
+        "random": 0.10,         # 10% random
+        "call_station": 0.10,   # 10% call station
+        "tag": 0.10,            # 10% tight-aggressive
+        "lag": 0.10,            # 10% loose-aggressive
+        "rock": 0.07,           # 7% rock (tight-passive)
+        "trapper": 0.07,        # 7% trapper (anti-aggro)
+        "value_bettor": 0.06,   # 6% value bettor (exploits never-fold)
     })
 
     # Historical self-play (v3.2) with anti-exploitation (v3.3)
