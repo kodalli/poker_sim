@@ -4,6 +4,54 @@ Research log tracking model training experiments, results, and lessons learned.
 
 ---
 
+## v9 - 2025-12-13
+
+**Summary**: LSTM-based opponent modeling for cross-hand memory
+
+**Hypothesis**: Adding an LSTM to encode opponent actions across hands would enable the model to adapt to different opponent playstyles dynamically, improving generalization.
+
+**Configuration**:
+- Architecture: ActorCriticMLPWithOpponentModel
+  - OpponentLSTM: 64 hidden, 32 embedding dim
+  - Opponent action encoding: 13 dims (9 action one-hot + bet_amount + round + pot_odds + position)
+  - LSTM output concatenated with observations before policy backbone
+- Starting chips: 200 (100BB)
+- Training: 100M steps, pure self-play
+- Opponent mix: Self-play only (mixed_opponents=False, historical_selfplay=False)
+
+**Results** (10,000 games each):
+| Opponent     | Win%  | BB/100  |
+|--------------|-------|---------|
+| random       | 62.1% | +1,316  |
+| call_station | 26.8% | -1,752  |
+
+**Training Checkpoints**:
+| Checkpoint | vs Random | vs Call Station |
+|------------|-----------|-----------------|
+| 76.8M      | 47.4% (+712)  | 17.8% (-1,640) |
+| 86.4M      | 60.4% (+1,016) | 25.1% (-2,342) |
+| 100M       | 62.1% (+1,316) | 26.8% (-1,752) |
+
+**Action Distribution**:
+- vs random: 13% fold, 7% check, 19% call, 27% raise_150, 7% all_in
+- vs call_station: 13% fold, 11% check, 2% call, 28% raise_150, 8% all_in
+
+**Analysis**:
+1. Strong performance vs random (+1316 BB/100) - best result so far
+2. Still struggles vs call_station (-1752 BB/100) - can't exploit someone who never folds
+3. Healthy action distribution with reasonable checking (7-11%) unlike v7/v8
+4. Training was stable - no instability in policy loss or explained variance
+5. **Critical limitation**: LSTM only ever saw self-play during training, so it learned to model "how my clone plays" rather than diverse opponent types
+
+**Lessons Learned**:
+1. Opponent modeling architecture works but needs diverse training opponents to be effective
+2. Pure self-play limits the LSTM's ability to learn opponent-type discrimination
+3. LSTM capacity (64 hidden) may be too small for encoding multiple distinct playstyles
+4. Next experiment should enable `--mixed-opponents` to expose LSTM to call_station, TAG, LAG, etc.
+5. Consider increasing LSTM hidden from 64 → 128 for more representational capacity
+
+---
+
 ## v8 - 2025-12-13
 
 **Summary**: v5-style opponent curriculum + deeper stacks (200BB)

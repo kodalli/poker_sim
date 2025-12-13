@@ -270,6 +270,8 @@ def create_network(
     """
     if network_type == "mlp":
         return ActorCriticMLP(hidden_dims=hidden_dims)
+    elif network_type == "mlp_opponent":
+        return ActorCriticMLPWithOpponentModel(hidden_dims=hidden_dims)
     elif network_type == "transformer":
         return ActorCriticTransformer()
     else:

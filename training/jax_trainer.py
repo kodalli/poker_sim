@@ -1766,6 +1766,12 @@ class JAXTrainer:
                 self.rng_key, reset_key = jrandom.split(self.rng_key)
                 state = reset(reset_key, games_per_position, config.starting_chips)
 
+                # Initialize LSTM state for opponent model
+                if config.use_opponent_model:
+                    lstm_hidden = jnp.zeros((games_per_position, OPPONENT_LSTM_HIDDEN), dtype=jnp.float32)
+                    lstm_cell = jnp.zeros((games_per_position, OPPONENT_LSTM_HIDDEN), dtype=jnp.float32)
+                    last_opp_action = jnp.zeros((games_per_position, OPPONENT_ACTION_DIM), dtype=jnp.float32)
+
                 # Run until all games done
                 max_steps = 500  # Safety limit
                 for _ in range(max_steps):
@@ -1781,9 +1787,15 @@ class JAXTrainer:
 
                     # Model action
                     self.rng_key, action_key = jrandom.split(self.rng_key)
-                    model_logits, _, _ = self.network.apply(
-                        {"params": self.params}, obs, training=False
-                    )
+                    if config.use_opponent_model:
+                        lstm_carry = (lstm_hidden, lstm_cell)
+                        model_logits, _, _, new_carry = self.network.apply(
+                            {"params": self.params}, obs, last_opp_action, lstm_carry, training=False
+                        )
+                    else:
+                        model_logits, _, _ = self.network.apply(
+                            {"params": self.params}, obs, training=False
+                        )
                     model_actions, _ = sample_action(action_key, model_logits, valid_mask)
                     # Convert from 1-indexed to 0-indexed for step()
                     model_actions = model_actions - 1
@@ -1800,6 +1812,27 @@ class JAXTrainer:
 
                     # Step
                     state = step(state, actions)
+
+                    # Update LSTM state for opponent model
+                    if config.use_opponent_model:
+                        # Update LSTM carry where model acted
+                        lstm_hidden = jnp.where(is_model_turn[:, None], new_carry[0], lstm_hidden)
+                        lstm_cell = jnp.where(is_model_turn[:, None], new_carry[1], lstm_cell)
+
+                        # Encode opponent action where opponent acted
+                        opp_acted = ~is_model_turn
+                        # opp_actions is 0-indexed, encode expects action type (also 0-indexed internally)
+                        opp_action_type = jnp.where(opp_acted, opp_actions + 1, jnp.zeros_like(opp_actions))
+                        game_idx = jnp.arange(games_per_position)
+                        opp_player_idx = 1 - model_position  # Opponent is always the other player
+                        opp_bet = state.bets[game_idx, opp_player_idx]
+
+                        # Encode from model's perspective (model_position is current player)
+                        current_player_arr = jnp.full(games_per_position, model_position, dtype=jnp.int32)
+                        encoded_opp = encode_opponent_action_from_state(
+                            state, opp_action_type, opp_bet, current_player_arr
+                        )
+                        last_opp_action = jnp.where(opp_acted[:, None], encoded_opp, last_opp_action)
 
                 # Get results
                 rewards = get_rewards(state)

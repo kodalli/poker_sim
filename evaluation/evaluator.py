@@ -15,8 +15,11 @@ from rich.table import Table
 
 from poker_jax.state import GameState, NUM_ACTIONS
 from poker_jax.game import reset, step, get_rewards
-from poker_jax.encoding import encode_state_for_current_player, get_valid_actions_from_obs, OBS_DIM
-from poker_jax.network import ActorCriticMLP, create_network, sample_action
+from poker_jax.encoding import (
+    encode_state_for_current_player, get_valid_actions_from_obs, OBS_DIM,
+    encode_opponent_action_from_state, OPPONENT_ACTION_DIM
+)
+from poker_jax.network import ActorCriticMLP, create_network, sample_action, OPPONENT_LSTM_HIDDEN
 
 from evaluation.opponents import OPPONENT_TYPES, NEEDS_OBS
 from evaluation.metrics import compute_bb_per_100, compute_confidence_interval, is_statistically_significant
@@ -107,7 +110,30 @@ class ModelEvaluator:
             checkpoint = pickle.load(f)
 
         self.params = checkpoint["params"]
-        self.network = create_network("mlp")
+
+        # Infer hidden dims from checkpoint params
+        hidden_dims = []
+        for i in range(10):  # Check up to 10 layers
+            key = f"Dense_{i}"
+            if key in self.params:
+                # Get output dim from kernel shape [input, output]
+                kernel_shape = self.params[key]["kernel"].shape
+                hidden_dims.append(kernel_shape[1])
+            else:
+                break
+        # Last few Dense layers are heads (policy, value), so use first 3 for backbone
+        if len(hidden_dims) >= 3:
+            hidden_dims = tuple(hidden_dims[:3])
+        else:
+            hidden_dims = (512, 256, 128)  # Default
+
+        # Detect if this is an opponent model (v9) by checking for LSTM params
+        self.use_opponent_model = "OpponentLSTM_0" in self.params
+
+        if self.use_opponent_model:
+            self.network = create_network("mlp_opponent", hidden_dims=hidden_dims)
+        else:
+            self.network = create_network("mlp", hidden_dims=hidden_dims)
 
         self.console.print(f"Loaded model from: [cyan]{model_path}[/cyan]")
 
@@ -116,14 +142,27 @@ class ModelEvaluator:
         obs: Array,
         valid_mask: Array,
         rng_key: Array,
-    ) -> Array:
-        """Get action from trained model."""
-        action_logits, _, _ = self.network.apply(
-            {"params": self.params}, obs, training=False
-        )
+        opp_action: Array | None = None,
+        lstm_carry: tuple | None = None,
+    ) -> tuple[Array, tuple | None]:
+        """Get action from trained model.
+
+        Returns:
+            Tuple of (actions, new_lstm_carry). new_lstm_carry is None for non-opponent models.
+        """
+        if self.use_opponent_model:
+            action_logits, _, _, new_carry = self.network.apply(
+                {"params": self.params}, obs, opp_action, lstm_carry, training=False
+            )
+        else:
+            action_logits, _, _ = self.network.apply(
+                {"params": self.params}, obs, training=False
+            )
+            new_carry = None
+
         # Use low temperature for more deterministic evaluation
         actions, _ = sample_action(rng_key, action_logits, valid_mask, temperature=0.1)
-        return actions
+        return actions, new_carry
 
     def _run_evaluation_batch(
         self,
@@ -164,6 +203,14 @@ class ModelEvaluator:
         max_steps = 200  # Safety limit per game
         needs_obs = opponent_name in NEEDS_OBS
 
+        # Initialize LSTM state for opponent model
+        if self.use_opponent_model:
+            lstm_hidden = jnp.zeros((n_games, OPPONENT_LSTM_HIDDEN), dtype=jnp.float32)
+            lstm_cell = jnp.zeros((n_games, OPPONENT_LSTM_HIDDEN), dtype=jnp.float32)
+            last_opp_action = jnp.zeros((n_games, OPPONENT_ACTION_DIM), dtype=jnp.float32)
+        else:
+            lstm_hidden = lstm_cell = last_opp_action = None
+
         for step_idx in range(max_steps):
             if jnp.all(state.done):
                 break
@@ -180,7 +227,13 @@ class ModelEvaluator:
             self.rng_key, model_key, opp_key = jrandom.split(self.rng_key, 3)
 
             # Get model actions for all games
-            model_actions = self._get_model_action(obs, valid_mask, model_key)
+            if self.use_opponent_model:
+                lstm_carry = (lstm_hidden, lstm_cell)
+                model_actions, new_carry = self._get_model_action(
+                    obs, valid_mask, model_key, last_opp_action, lstm_carry
+                )
+            else:
+                model_actions, _ = self._get_model_action(obs, valid_mask, model_key)
 
             # Get opponent actions for all games
             if needs_obs:
@@ -200,6 +253,25 @@ class ModelEvaluator:
 
             # Step environment
             state = step(state, actions)
+
+            # Update LSTM state for opponent model
+            if self.use_opponent_model:
+                # Update LSTM carry where model acted
+                lstm_hidden = jnp.where(is_model_turn[:, None], new_carry[0], lstm_hidden)
+                lstm_cell = jnp.where(is_model_turn[:, None], new_carry[1], lstm_cell)
+
+                # Encode opponent action where opponent acted
+                opp_acted = ~is_model_turn & ~state.done
+                opp_action_type = jnp.where(opp_acted, opp_actions + 1, jnp.zeros_like(opp_actions))
+                game_idx = jnp.arange(n_games)
+                opp_player_idx = 1 - model_position
+                opp_bet = state.bets[game_idx, opp_player_idx]
+
+                current_player_arr = jnp.full(n_games, model_position, dtype=jnp.int32)
+                encoded_opp = encode_opponent_action_from_state(
+                    state, opp_action_type, opp_bet, current_player_arr
+                )
+                last_opp_action = jnp.where(opp_acted[:, None], encoded_opp, last_opp_action)
 
         # Compute final results from rewards
         rewards = get_rewards(state)
