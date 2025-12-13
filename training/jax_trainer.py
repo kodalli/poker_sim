@@ -165,7 +165,7 @@ class JAXTrainingConfig:
     use_opponent_model: bool = False  # Enable LSTM-based opponent modeling
     opponent_lstm_hidden: int = 64  # LSTM hidden dimension
     opponent_embed_dim: int = 32  # Opponent embedding dimension
-    bptt_window_size: int = 64  # Truncated BPTT window size for sequential processing
+    bptt_window_size: int = 32  # Truncated BPTT window size for sequential processing
 
 
 # Opponent type indices for mixed training
@@ -958,9 +958,8 @@ class JAXTrainer:
         all_model_masks = []  # v3.6: Track which steps are model's turns (for mixed opponent training)
 
         # v9: Opponent model storage (only used if use_opponent_model=True)
+        # Note: LSTM states are NOT stored - they're recomputed during training to save GPU memory
         all_opp_actions = []
-        all_lstm_hidden = []
-        all_lstm_cell = []
 
         total_rewards = 0.0
         games_completed = 0
@@ -1050,10 +1049,8 @@ class JAXTrainer:
             all_valid_masks.append(valid_mask)
             all_model_masks.append(model_mask)  # v3.6: Store model turn mask
 
-            # v9: Store LSTM carry and opponent actions
+            # v9: Store opponent actions (LSTM states no longer stored - recomputed during training)
             if config.use_opponent_model and new_carry is not None:
-                all_lstm_hidden.append(state.opp_lstm_hidden)  # Store carry BEFORE update
-                all_lstm_cell.append(state.opp_lstm_cell)
                 all_opp_actions.append(state.last_opp_action)
 
                 # Update LSTM carry in state (new_carry from forward pass)
@@ -1165,10 +1162,8 @@ class JAXTrainer:
                 dones=jnp.stack(all_dones),  # [T, N]
                 valid_masks=jnp.stack(all_valid_masks),  # [T, N, 9]
                 model_masks=jnp.stack(all_model_masks),  # [T, N] - v3.6: 1.0 when model acted, 0.0 on opponent turns
-                # v9 fields
+                # v9 fields (LSTM states recomputed during training, not stored)
                 opp_actions=jnp.stack(all_opp_actions),  # [T, N, OPPONENT_ACTION_DIM]
-                lstm_hidden=jnp.stack(all_lstm_hidden),  # [T, N, lstm_hidden_dim]
-                lstm_cell=jnp.stack(all_lstm_cell),  # [T, N, lstm_hidden_dim]
             )
         else:
             # Legacy trajectory (no opponent model)
@@ -1193,6 +1188,207 @@ class JAXTrainer:
             steps_per_second=total_steps / max(elapsed, 0.001),
             games_per_second=games_completed / max(elapsed, 0.001),
             # Poker behavior
+            wins=wins,
+            losses=losses,
+            total_pot_won=total_pot_won,
+            action_counts=action_counts,
+        )
+
+        return trajectory, metrics
+
+    def _create_opponent_model_scan_fn(self):
+        """Create JIT-compiled scan function for opponent model rollout.
+
+        Returns:
+            JIT-compiled scan function for self-play with opponent modeling.
+        """
+        network = self.network
+        config = self.training_config
+        n_games = config.num_parallel_games
+        starting_chips = config.starting_chips
+        small_blind = config.small_blind
+        big_blind = config.big_blind
+
+        @jax.jit
+        def scan_step(carry, _):
+            """Single step in opponent model rollout (self-play).
+
+            Inlined step logic to avoid nested JIT compilation issues.
+            """
+            state, rng_key, params = carry
+
+            # Split RNG
+            rng_key, step_key, reset_key = jrandom.split(rng_key, 3)
+
+            # Get opponent action from state
+            opp_action = state.last_opp_action
+
+            # === INLINED STEP LOGIC (from _collect_step) ===
+            # Encode state for current player
+            obs = encode_state_for_current_player(state)
+
+            # Get valid actions
+            valid_mask = get_valid_actions_from_obs(obs)
+
+            # Forward pass with opponent model
+            lstm_carry = (state.opp_lstm_hidden, state.opp_lstm_cell)
+            action_logits, bet_frac, values, new_carry = network.apply(
+                {"params": params}, obs, opp_action, lstm_carry, training=False
+            )
+            values = values.squeeze(-1)
+
+            # Sample actions
+            step_key, sample_key = jrandom.split(step_key)
+            actions, log_probs = sample_action(sample_key, action_logits, valid_mask)
+
+            # Convert to game actions (add 1 for offset)
+            game_actions = actions + 1  # 0->1 (fold), 1->2 (check), etc.
+
+            # Compute raise amounts for raise actions
+            game_idx = jnp.arange(n_games)
+            opp_idx = 1 - state.current_player
+            opp_bet = state.bets[game_idx, opp_idx]
+            raise_amounts = opp_bet + state.last_raise_amount
+
+            # Step environment
+            new_state = step(state, game_actions, raise_amounts)
+
+            # Get rewards for current player (before step)
+            rewards = get_rewards(new_state)
+            player_rewards = rewards[game_idx, state.current_player]
+
+            # Done flags
+            dones = new_state.done.astype(jnp.float32)
+            # === END INLINED STEP LOGIC ===
+
+            # Encode opponent action after step (for next iteration)
+            # The action taken by "us" is the opponent's action from their perspective
+            new_opp_bet = new_state.bets[game_idx, opp_idx]
+            encoded_opp_action = encode_opponent_action_from_state(
+                new_state, game_actions, new_opp_bet, state.current_player
+            )
+
+            # Update state with new LSTM carry and opponent action
+            new_state = new_state._replace(
+                opp_lstm_hidden=new_carry[0],
+                opp_lstm_cell=new_carry[1],
+                last_opp_action=encoded_opp_action,
+            )
+
+            # Reset completed games
+            fresh_state = reset(
+                reset_key, n_games, starting_chips, small_blind, big_blind
+            )
+
+            def select_state(fresh, old):
+                done_mask = new_state.done
+                for _ in range(old.ndim - 1):
+                    done_mask = done_mask[:, None]
+                return jnp.where(done_mask, fresh, old)
+
+            next_state = jax.tree_util.tree_map(select_state, fresh_state, new_state)
+
+            # Store LSTM state for trajectory (state BEFORE this step's update)
+            lstm_hidden = state.opp_lstm_hidden
+            lstm_cell = state.opp_lstm_cell
+
+            # Output for this step
+            step_data = (
+                obs, actions, log_probs, values, player_rewards, dones, valid_mask,
+                opp_action, lstm_hidden, lstm_cell
+            )
+
+            return (next_state, rng_key, params), step_data
+
+        return scan_step
+
+    def collect_rollout_opponent_model(
+        self,
+        num_steps: int,
+    ) -> tuple[Trajectory, TrainingMetrics]:
+        """Collect rollout for opponent model training (self-play with LSTM).
+
+        Uses JIT-compiled jax.lax.scan for fast GPU execution.
+
+        Args:
+            num_steps: Number of steps to collect
+
+        Returns:
+            Tuple of (trajectory, metrics)
+        """
+        config = self.training_config
+        n_games = config.num_parallel_games
+
+        # Initialize games
+        self.rng_key, reset_key = jrandom.split(self.rng_key)
+        state = reset(
+            reset_key, n_games,
+            config.starting_chips, config.small_blind, config.big_blind
+        )
+
+        start_time = time.time()
+
+        # Get or create cached scan function
+        if not hasattr(self, "_opp_model_scan_cache"):
+            self._opp_model_scan_cache = self._create_opponent_model_scan_fn()
+        scan_fn = self._opp_model_scan_cache
+
+        # Run scan (fully JIT-compiled loop on GPU)
+        self.rng_key, loop_key = jrandom.split(self.rng_key)
+        carry = (state, loop_key, self.params)
+        _, step_data = jax.lax.scan(scan_fn, carry, None, length=num_steps)
+
+        # Unpack step data
+        (all_obs, all_actions, all_log_probs, all_values, all_rewards, all_dones,
+         all_valid_masks, all_opp_actions, all_lstm_hidden, all_lstm_cell) = step_data
+
+        elapsed = time.time() - start_time
+
+        # Build trajectory with v9 fields
+        trajectory = Trajectory(
+            obs=all_obs,  # [T, N, obs_dim]
+            actions=all_actions,  # [T, N]
+            log_probs=all_log_probs,  # [T, N]
+            values=all_values,  # [T, N]
+            rewards=all_rewards,  # [T, N]
+            dones=all_dones,  # [T, N]
+            valid_masks=all_valid_masks,  # [T, N, 9]
+            model_masks=None,  # Self-play: all steps are model's
+            opp_actions=all_opp_actions,  # [T, N, opp_action_dim]
+            lstm_hidden=all_lstm_hidden,  # [T, N, lstm_hidden_dim]
+            lstm_cell=all_lstm_cell,  # [T, N, lstm_hidden_dim]
+        )
+
+        # Compute metrics (done on CPU after scan completes)
+        total_steps = num_steps * n_games
+        games_completed = int(all_dones.sum())
+        total_rewards = float(all_rewards.sum())
+
+        # Action counts
+        action_idx_to_name = {
+            1: "fold", 2: "check", 3: "call",
+            4: "raise_33", 5: "raise_66", 6: "raise_100", 7: "raise_150",
+            8: "all_in"
+        }
+        action_counts = {}
+        for idx, name in action_idx_to_name.items():
+            action_counts[name] = int((all_actions == idx).sum())
+
+        # Win/loss tracking
+        done_mask = all_dones > 0.5
+        won_games = (all_rewards > 0) & done_mask
+        lost_games = (all_rewards < 0) & done_mask
+        wins = int(won_games.sum())
+        losses = int(lost_games.sum())
+        total_pot_won = float(jnp.where(won_games, all_rewards, 0.0).sum())
+
+        metrics = TrainingMetrics(
+            steps=total_steps,
+            games_completed=games_completed,
+            avg_reward=total_rewards / max(games_completed, 1),
+            avg_game_length=total_steps / max(games_completed, 1),
+            steps_per_second=total_steps / max(elapsed, 0.001),
+            games_per_second=games_completed / max(elapsed, 0.001),
             wins=wins,
             losses=losses,
             total_pot_won=total_pot_won,
@@ -1721,9 +1917,13 @@ class JAXTrainer:
                     total_games += collect_metrics.games_completed
 
                 else:
-                    # === LEGACY TRAINING (v1-v3) ===
-                    # Collect rollout (pass current step for dynamic opponent scheduling)
-                    trajectory, collect_metrics = self.collect_rollout(steps_per_game, current_step=global_step)
+                    # === LEGACY TRAINING (v1-v3) / v9 OPPONENT MODEL ===
+                    if config.use_opponent_model:
+                        # v9: Use scan-optimized rollout collection for opponent model
+                        trajectory, collect_metrics = self.collect_rollout_opponent_model(steps_per_game)
+                    else:
+                        # Legacy: Collect rollout (pass current step for dynamic opponent scheduling)
+                        trajectory, collect_metrics = self.collect_rollout(steps_per_game, current_step=global_step)
 
                     global_step += collect_metrics.steps
                     total_games += collect_metrics.games_completed

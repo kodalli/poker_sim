@@ -685,6 +685,8 @@ def ppo_update(
     return params, opt_state, PPOMetrics(**final_metrics)
 
 
+
+
 def ppo_update_sequential(
     network: nn.Module,
     params: dict,
@@ -700,12 +702,15 @@ def ppo_update_sequential(
     Splits trajectory into windows, shuffles windows (not individual steps),
     and unrolls LSTM through each window for gradient computation.
 
+    LSTM states are recomputed from the opp_actions sequence rather than stored,
+    saving ~2.4GB GPU memory per rollout.
+
     Args:
         network: Flax network with opponent model
         params: Network parameters
         opt_state: Optimizer state
         optimizer: Optax optimizer
-        trajectory: Trajectory with v9 fields (opp_actions, lstm_hidden, lstm_cell)
+        trajectory: Trajectory with v9 fields (opp_actions). LSTM states are recomputed.
         config: PPO config
         rng_key: PRNG key
         window_size: Truncated BPTT window size (default 64)
@@ -742,8 +747,6 @@ def ppo_update_sequential(
     # Truncate all trajectory arrays
     obs_trunc = trajectory.obs[:truncated_T]
     opp_actions_trunc = trajectory.opp_actions[:truncated_T]
-    lstm_hidden_trunc = trajectory.lstm_hidden[:truncated_T]
-    lstm_cell_trunc = trajectory.lstm_cell[:truncated_T]
     actions_trunc = trajectory.actions[:truncated_T]
     log_probs_trunc = trajectory.log_probs[:truncated_T]
     advantages_trunc = advantages[:truncated_T]
@@ -764,8 +767,6 @@ def ppo_update_sequential(
 
     obs_windows = reshape_to_windows(obs_trunc)
     opp_actions_windows = reshape_to_windows(opp_actions_trunc)
-    lstm_hidden_windows = reshape_to_windows(lstm_hidden_trunc)
-    lstm_cell_windows = reshape_to_windows(lstm_cell_trunc)
     actions_windows = reshape_to_windows(actions_trunc)
     log_probs_windows = reshape_to_windows(log_probs_trunc)
     advantages_windows = reshape_to_windows(advantages_trunc)
@@ -773,10 +774,20 @@ def ppo_update_sequential(
     valid_masks_windows = reshape_to_windows(valid_masks_trunc)
     model_masks_windows = reshape_to_windows(model_masks_trunc) if model_masks_trunc is not None else None
 
-    # For each window, initial carry is lstm state at start (index 0 of window)
-    # [n_windows, N, lstm_hidden_dim]
+    # Extract LSTM states at window boundaries from stored trajectory
+    # trajectory.lstm_hidden: [T, N, lstm_hidden_dim]
+    # We need the state at the START of each window (step 0, window_size, 2*window_size, ...)
+    lstm_hidden_trunc = trajectory.lstm_hidden[:truncated_T]
+    lstm_cell_trunc = trajectory.lstm_cell[:truncated_T]
+
+    # Reshape to windows: [n_windows, window_size, N, lstm_hidden_dim]
+    lstm_hidden_windows = reshape_to_windows(lstm_hidden_trunc)
+    lstm_cell_windows = reshape_to_windows(lstm_cell_trunc)
+
+    # Extract initial carry for each window (state at index 0 of each window)
+    # [n_windows, window_size, N, dim] -> [n_windows, N, dim] (take index 0 along window_size axis)
     initial_hidden = lstm_hidden_windows[:, 0, :, :]  # [n_windows, N, lstm_hidden_dim]
-    initial_cell = lstm_cell_windows[:, 0, :, :]
+    initial_cell = lstm_cell_windows[:, 0, :, :]  # [n_windows, N, lstm_hidden_dim]
 
     # Flatten windows and games: [n_windows * N]
     # We'll process each (window, game) pair as a separate sequence
