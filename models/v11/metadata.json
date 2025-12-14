@@ -1,0 +1,20 @@
+{
+  "version": "v11",
+  "architecture": "actor_critic_jax",
+  "generations": 162760,
+  "population_size": 1536,
+  "best_fitness": 0.0,
+  "created": "2025-12-13T21:01:22.265033",
+  "description": "JAX training - 500,000,000 steps",
+  "config": {
+    "learning_rate": 0.0003,
+    "total_steps": 500000000,
+    "parallel_games": 1536,
+    "training_method": "ppo_jax",
+    "steps_per_second": 60293.2729240284,
+    "mixed_opponents": true,
+    "historical_selfplay": false,
+    "adversarial_training": false,
+    "opponent_model": true
+  }
+}

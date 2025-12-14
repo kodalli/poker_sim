@@ -1,0 +1,112 @@
+[
+  {
+    "active_infos": 200000,
+    "non_uniform": 4081,
+    "pure_strategies": 2400,
+    "mixed_strategies": 197600,
+    "aggression": 0.5548171997070312,
+    "passivity": 0.22482404112815857,
+    "fold_rate": 0.10916458815336227,
+    "iteration": 10000,
+    "elapsed_sec": 227.73653769493103
+  },
+  {
+    "active_infos": 200000,
+    "non_uniform": 4089,
+    "pure_strategies": 2423,
+    "mixed_strategies": 197577,
+    "aggression": 0.5547959804534912,
+    "passivity": 0.22485604882240295,
+    "fold_rate": 0.1091575175523758,
+    "iteration": 20000,
+    "elapsed_sec": 447.0889108181
+  },
+  {
+    "active_infos": 200000,
+    "non_uniform": 4094,
+    "pure_strategies": 2434,
+    "mixed_strategies": 197566,
+    "aggression": 0.5547787547111511,
+    "passivity": 0.22487622499465942,
+    "fold_rate": 0.10915380716323853,
+    "iteration": 30000,
+    "elapsed_sec": 666.6649327278137
+  },
+  {
+    "active_infos": 200000,
+    "non_uniform": 4096,
+    "pure_strategies": 2441,
+    "mixed_strategies": 197559,
+    "aggression": 0.5547671914100647,
+    "passivity": 0.22488954663276672,
+    "fold_rate": 0.10915108770132065,
+    "iteration": 40000,
+    "elapsed_sec": 886.6664543151855
+  },
+  {
+    "active_infos": 200000,
+    "non_uniform": 4096,
+    "pure_strategies": 2449,
+    "mixed_strategies": 197551,
+    "aggression": 0.554761528968811,
+    "passivity": 0.22489657998085022,
+    "fold_rate": 0.10914938896894455,
+    "iteration": 50000,
+    "elapsed_sec": 1104.4086232185364
+  },
+  {
+    "active_infos": 200000,
+    "non_uniform": 4100,
+    "pure_strategies": 2453,
+    "mixed_strategies": 197547,
+    "aggression": 0.5547580122947693,
+    "passivity": 0.2249016910791397,
+    "fold_rate": 0.10914812237024307,
+    "iteration": 60000,
+    "elapsed_sec": 1318.2172322273254
+  },
+  {
+    "active_infos": 200000,
+    "non_uniform": 4101,
+    "pure_strategies": 2455,
+    "mixed_strategies": 197545,
+    "aggression": 0.554755687713623,
+    "passivity": 0.22490528225898743,
+    "fold_rate": 0.10914696753025055,
+    "iteration": 70000,
+    "elapsed_sec": 1532.0700690746307
+  },
+  {
+    "active_infos": 200000,
+    "non_uniform": 4103,
+    "pure_strategies": 2456,
+    "mixed_strategies": 197544,
+    "aggression": 0.5547532439231873,
+    "passivity": 0.2249087542295456,
+    "fold_rate": 0.1091458797454834,
+    "iteration": 80000,
+    "elapsed_sec": 1745.9596998691559
+  },
+  {
+    "active_infos": 200000,
+    "non_uniform": 4103,
+    "pure_strategies": 2455,
+    "mixed_strategies": 197545,
+    "aggression": 0.5547517538070679,
+    "passivity": 0.224911168217659,
+    "fold_rate": 0.10914494097232819,
+    "iteration": 90000,
+    "elapsed_sec": 1962.8706617355347
+  },
+  {
+    "active_infos": 200000,
+    "non_uniform": 4104,
+    "pure_strategies": 2457,
+    "mixed_strategies": 197543,
+    "aggression": 0.5547506213188171,
+    "passivity": 0.22491306066513062,
+    "fold_rate": 0.10914421826601028,
+    "iteration": 100000,
+    "elapsed_sec": 2184.452915430069
+  }
+]

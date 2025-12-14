@@ -1,0 +1,18 @@
+{
+  "iterations": 500,
+  "traversals_per_iter": 4096,
+  "train_steps_per_iter": 100,
+  "batch_size": 2048,
+  "learning_rate": 0.0001,
+  "weight_decay": 1e-05,
+  "memory_size": 2000000,
+  "hidden_dims": [
+    512,
+    256,
+    128
+  ],
+  "use_outcome_values": false,
+  "total_samples": 4861330,
+  "training_time_sec": 573.672801733017,
+  "final_loss": 0.0004517189704347402
+}

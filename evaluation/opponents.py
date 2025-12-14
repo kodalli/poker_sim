@@ -481,3 +481,16 @@ OPPONENT_TYPES = {
 
 # Opponents that need obs parameter
 NEEDS_OBS = {"tag", "lag", "rock", "trapper", "value_bettor"}
+
+
+# ========== CFR OPPONENT (optional, requires trained strategy) ==========
+def register_cfr_opponent(strategy_path: str) -> None:
+    """Register CFR opponent with a trained strategy.
+
+    Args:
+        strategy_path: Path to the CFR strategy .npy file
+    """
+    from cfr.cfr_opponent import create_cfr_opponent
+    cfr_opponent = create_cfr_opponent(strategy_path)
+    OPPONENT_TYPES["cfr"] = cfr_opponent
+    NEEDS_OBS.add("cfr")

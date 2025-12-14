@@ -4,6 +4,203 @@ Research log tracking model training experiments, results, and lessons learned.
 
 ---
 
+## Single Deep CFR V1 - 2025-12-14
+
+**Summary**: First neural network-based CFR implementation to replace tabular CFR
+
+**Hypothesis**: A neural network can learn to predict counterfactual advantages directly from game states, eliminating the need for hand abstraction and achieving better generalization.
+
+**Configuration**:
+- Algorithm: Single Deep CFR (SD-CFR) with external sampling MCCFR
+- Network: MLP [443 → 512 → 256 → 128 → 9] (394K params)
+- Training: 500 iterations, 4096 traversals/iter, 100 train steps/iter
+- Memory: 2M reservoir buffer with linear CFR averaging
+- Total samples: ~4.86M traversal decisions
+- Training time: 9.6 min on RTX 4090
+
+**Results** (10,000 games each):
+| Opponent     | Win%  | BB/100  | vs CFR V3 Δ |
+|--------------|-------|---------|-------------|
+| random       | 64.7% | +927    | +42         |
+| call_station | 31.8% | -849    | **-1535**   |
+| tag          | 89.5% | +439    | **+656**    |
+| lag          | 60.5% | +652    | -154        |
+| rock         | 82.4% | -888    | -383        |
+| trapper      | 67.9% | -1169   | -1031       |
+| value_bettor | 89.9% | -476    | -309        |
+| **TOTAL**    |       | -1363   | -2715       |
+
+**Analysis**:
+1. **Beats aggressive opponents**: TAG +439 (huge gain!), random +927, lag +652
+2. **Struggles against passive opponents**: call_station -849, rock -888, trapper -1169
+3. **High win rates but negative BB/100** = winning small pots, losing big ones (same pattern as tabular CFR)
+4. Only 500 iterations - Deep CFR typically needs 10,000+ for proper convergence
+5. Bootstrap advantage targets (network predicting its own outputs) may cause feedback loops
+
+**Key Difference from Tabular CFR**:
+- SD-CFR uses neural network to predict advantages (no hand abstraction)
+- Network generalizes across similar situations
+- Much faster per-iteration but needs more iterations to converge
+
+**Lessons Learned**:
+1. **500 iterations insufficient** - Deep CFR needs 10K+ iterations for convergence
+2. **Bootstrap targets problematic** - using network's own predictions as training targets creates feedback loops
+3. **Should use outcome-based values** - traverse to terminal states and use actual utilities
+4. **Need more training** - the loss (0.0005) is low but the network hasn't learned good strategies yet
+5. **Potential improvements**:
+   - Train for 10,000+ iterations
+   - Use `--use-outcome-values` flag for more accurate advantage computation
+   - Increase traversals per iteration for more diverse game situations
+   - Consider DREAM or Double Neural CFR for better convergence
+
+---
+
+## CFR V3 - 2025-12-14
+
+**Summary**: Reduced abstraction CFR for better convergence (50K info sets vs 200K)
+
+**Hypothesis**: The V2 CFR had only 2% non-uniform strategies because info sets weren't visited enough. Reducing the abstraction space from 200K to 50K would increase visits per info set by 4x, leading to better strategy convergence.
+
+**Configuration**:
+- Algorithm: Monte Carlo CFR+ (MCCFR) with outcome sampling
+- Abstraction V3 (reduced):
+  - Hand buckets: Preflop 169, Flop 15, Turn 10, River 10
+  - History encoding: 27 keys (3 pot ratios × 3 bet levels × 3 bet sizes)
+  - Total: ~50,000 info set slots
+- Training: 100K iterations, batch_size=4096
+- Total samples: 409.6M games (~36 min on RTX 4090)
+
+**Results** (10,000 games each):
+| Opponent     | Win%  | BB/100  | vs V2 Δ |
+|--------------|-------|---------|---------|
+| random       | 61.1% | +885    | +7      |
+| call_station | 45.1% | +686    | **+85** |
+| tag          | 62.8% | -217    | **+52** |
+| lag          | 50.8% | +806    | **+138**|
+| rock         | 69.0% | -505    | -6      |
+| trapper      | 58.2% | -138    | **+56** |
+| value_bettor | 79.4% | -167    | **+28** |
+
+**Convergence Metrics**:
+- V2: 4,104 non-uniform / 200,000 active (2.05%)
+- V3: 1,933 non-uniform / 50,000 active (3.87%)
+- V3 achieved nearly 2x the proportion of non-uniform strategies
+
+**Analysis**:
+1. **Reduced abstraction improved performance** on 6 of 7 opponents
+2. **Biggest gains vs aggressive opponents**: LAG +138, call_station +85
+3. **Still loses to sophisticated opponents**: TAG, rock, trapper, value_bettor
+4. High win rates but negative BB/100 = winning small pots, losing big ones
+5. Strategy distribution stable: 55.4% aggression, 22.7% passivity, 10.7% fold
+
+**Lessons Learned**:
+1. **Fewer info sets = more visits = better convergence** - the hypothesis was confirmed
+2. **CFR abstraction quality matters more than quantity** - 50K well-visited > 200K sparse
+3. **CFR struggles with deep-stack play** - loses to opponents who trap/value bet
+4. **Potential improvements**:
+   - Train longer (500K+ iterations) with reduced abstraction
+   - Better river bucketing (hand categories instead of equity)
+   - Consider NFSP (Neural Fictitious Self-Play) to combine PPO + CFR
+
+---
+
+## CFR V2 - 2025-12-14
+
+**Summary**: First improved CFR with finer abstraction (200K info sets)
+
+**Configuration**:
+- Algorithm: Monte Carlo CFR+ (MCCFR)
+- Abstraction V2 (finer buckets):
+  - Hand buckets: Preflop 169, Flop 50, Turn 30, River 20
+  - History encoding: 80 keys (5 pot ratios × 4 bet levels × 4 bet sizes)
+  - Total: ~200,000 info set slots
+- Training: 100K iterations, batch_size=4096
+- Total samples: 409.6M games
+
+**Results** (10,000 games each):
+| Opponent     | Win%  | BB/100  |
+|--------------|-------|---------|
+| random       | 60.3% | +878    |
+| call_station | 45.0% | +601    |
+| tag          | 61.8% | -269    |
+| lag          | 51.0% | +668    |
+| rock         | 69.5% | -499    |
+| trapper      | 58.7% | -194    |
+| value_bettor | 79.3% | -195    |
+
+**Analysis**:
+1. Only 4,104 of 200,000 info sets had non-uniform strategies (2%)
+2. Most situations played near-uniform (essentially random)
+3. Won against random/call_station/LAG but lost to sophisticated opponents
+4. High win rates but negative BB/100 indicates poor value betting
+
+**Lessons Learned**:
+1. 200K info sets too sparse with 409M samples (~2K visits per slot)
+2. Need more visits per info set for CFR to converge
+3. Reduced abstraction would increase visit frequency
+
+---
+
+## v11 - 2025-12-13
+
+**Summary**: Extended training (500M steps) with full opponent diversity (all 7 types)
+
+**Hypothesis**: Longer training with exposure to ALL opponent types (including rock, trapper, value_bettor) would enable the model to develop more robust strategies and improve against passive/trapping opponents.
+
+**Configuration**:
+- Architecture: ActorCriticMLPWithOpponentModel (same as v9/v10)
+  - OpponentLSTM: 64 hidden, 32 embedding dim
+- Starting chips: 200 (100BB)
+- Training: **500M steps** (5x longer than v10)
+- **Full Mixed Opponent Training**: 40% self, 10% random, 10% call_station, 10% TAG, 10% LAG, 7% rock, 7% trapper, 6% value_bettor
+
+**Results** (10,000 games each):
+| Opponent     | Win%  | BB/100  | vs v10 Δ |
+|--------------|-------|---------|----------|
+| random       | 78.8% | +2,711  | **+1,672** |
+| call_station | 38.4% | -1,396  | -334     |
+| tag          | 96.4% | +939    | **+557** |
+| lag          | 78.9% | +2,591  | **+2,260** |
+| rock         | 86.3% | -330    | -89      |
+| trapper      | 77.0% | -331    | +19      |
+| value_bettor | 91.2% | -105    | +9       |
+
+**Aggregate Performance**:
+- v9 total: -929 BB/100
+- v10 total: -15 BB/100
+- **v11 total: +4,080 BB/100** 🚀
+
+**Action Distribution**:
+- Learned heavy checking: 22-40% check rate (vs 5-17% in v10)
+- 40% check vs call_station - excellent pot control!
+- Low fold rates (2-7%) - confident play
+- Adapts aggression per opponent
+
+**Training Observations**:
+- Mid-training dip (100-250M): vs_random dropped to negative BB/100
+- Recovery (300M+): Performance rebounded strongly
+- Explained variance: Only reached ~12% (room for value function improvement)
+- Policy loss: Converged to ~0.0005 (stable)
+
+**Analysis**:
+1. **Massive gains vs aggressive opponents**: random +1,672, lag +2,260, tag +557
+2. **Still struggles vs call_station**: -1,396 BB/100 (worse than v10's -1,062)
+3. **Learned pot control**: 40% checking vs call_station shows adaptation
+4. **High win rates across board**: 77-96% vs all except call_station (38%)
+5. **5x training paid off**: Total BB/100 went from -15 to +4,080
+
+**Lessons Learned**:
+1. **Longer training (500M) significantly helps** - model continued improving past 100M
+2. **Full opponent diversity works** - adding rock/trapper/value_bettor to mix helped
+3. **Trade-off shifted**: Now dominates aggressive opponents but regressed vs call_station
+4. **Explained variance at 12%** suggests value function could still improve with more training or architecture changes
+5. **Potential next steps**:
+   - Try 1B steps to see if improvement continues
+   - Increase LSTM capacity (64 → 128) for finer opponent modeling
+   - Consider curriculum: heavy call_station first, then diversify
+
+---
+
 ## v10 - 2025-12-13
 
 **Summary**: Mixed opponent training with LSTM opponent model
