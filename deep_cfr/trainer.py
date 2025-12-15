@@ -148,6 +148,7 @@ def train_single_deep_cfr(
     output_dir: str = "models/deep_cfr",
     seed: int = 42,
     use_outcome_values: bool = False,
+    resume_from: str = None,
 ):
     """Train Single Deep CFR.
 
@@ -166,6 +167,7 @@ def train_single_deep_cfr(
         output_dir: Output directory for checkpoints
         seed: Random seed
         use_outcome_values: Use outcome-based advantage computation (slower but more accurate)
+        resume_from: Path to checkpoint file to resume from (e.g., 'models/deep_cfr/params_iter5000.pkl')
     """
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -195,6 +197,32 @@ def train_single_deep_cfr(
     n_params = count_parameters(params)
     print(f"Network parameters: {n_params:,}")
 
+    # Resume from checkpoint if specified
+    start_iteration = 1
+    if resume_from is not None:
+        import pickle
+        import re
+        resume_path = Path(resume_from)
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {resume_from}")
+
+        with open(resume_path, 'rb') as f:
+            params = pickle.load(f)
+
+        # Extract iteration number from filename (e.g., params_iter5000.pkl -> 5000)
+        match = re.search(r'iter(\d+)', resume_path.name)
+        if match:
+            start_iteration = int(match.group(1)) + 1
+            print(f"Resuming from iteration {start_iteration - 1}")
+        else:
+            print(f"Warning: Could not parse iteration from filename, starting from 1")
+
+        # Advance RNG state to match where we left off
+        for _ in range(start_iteration - 1):
+            rng_key, _ = jrandom.split(rng_key)
+
+        print(f"Loaded checkpoint: {resume_from}")
+
     # Create optimizer
     optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
@@ -212,7 +240,7 @@ def train_single_deep_cfr(
 
     print("\nStarting training...")
 
-    for iteration in range(1, iterations + 1):
+    for iteration in range(start_iteration, iterations + 1):
         iter_start = time.time()
 
         # === Phase 1: Traverse games and collect samples ===
@@ -346,6 +374,7 @@ def main():
     parser.add_argument("--output-dir", type=str, default="models/deep_cfr", help="Output directory")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--use-outcome-values", action="store_true", help="Use outcome-based advantages")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
 
     args = parser.parse_args()
 
@@ -364,6 +393,7 @@ def main():
         output_dir=args.output_dir,
         seed=args.seed,
         use_outcome_values=args.use_outcome_values,
+        resume_from=args.resume,
     )
 
 
