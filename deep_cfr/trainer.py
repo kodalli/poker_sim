@@ -87,6 +87,52 @@ def train_step(
     return new_params, new_opt_state, loss
 
 
+def _make_multi_step_train(network, optimizer, n_steps: int):
+    """Create JIT-compiled multi-step training function."""
+
+    @jax.jit
+    def multi_step_train(params, opt_state, batches, rng_key):
+        """Train for n_steps on pre-sampled batches.
+
+        Args:
+            params: Network parameters
+            opt_state: Optimizer state
+            batches: (obs, adv, weights) each with shape [n_steps, batch_size, ...]
+            rng_key: PRNG key
+
+        Returns:
+            new_params, new_opt_state, mean_loss
+        """
+        obs_batches, adv_batches, weight_batches = batches
+
+        def body_fn(i, carry):
+            params, opt_state, total_loss, rng_key = carry
+            rng_key, step_key = jrandom.split(rng_key)
+
+            # Get batch for this step
+            batch = (obs_batches[i], adv_batches[i], weight_batches[i])
+
+            # Train step
+            params, opt_state, loss = train_step(
+                params, opt_state, batch, step_key, network, optimizer
+            )
+
+            return (params, opt_state, total_loss + loss, rng_key)
+
+        init_carry = (params, opt_state, 0.0, rng_key)
+        params, opt_state, total_loss, _ = jax.lax.fori_loop(
+            0, n_steps, body_fn, init_carry
+        )
+
+        return params, opt_state, total_loss / n_steps
+
+    return multi_step_train
+
+
+# Cache for multi-step train functions
+_TRAIN_CACHE = {}
+
+
 def train_single_deep_cfr(
     iterations: int = 10_000,
     traversals_per_iter: int = 4096,
@@ -94,7 +140,7 @@ def train_single_deep_cfr(
     batch_size: int = 2048,
     learning_rate: float = 1e-4,
     weight_decay: float = 1e-5,
-    memory_size: int = 2_000_000,
+    memory_size: int = 10_000_000,  # 10M samples (CPU storage, GPU sampling)
     max_game_steps: int = 50,
     hidden_dims: tuple = (512, 256, 128),
     checkpoint_every: int = 1000,
@@ -193,26 +239,26 @@ def train_single_deep_cfr(
             memory.add_batch(obs, advantages, iteration, rng)
 
         # === Phase 2: Train network on memory samples ===
-        iter_losses = []
+        avg_loss = 0.0
 
         if len(memory) >= batch_size:
-            for _ in range(train_steps_per_iter):
-                # Sample batch with linear weighting
-                batch_obs, batch_adv, batch_weights = memory.sample_weighted(batch_size, rng)
-
-                # Get dropout key
-                rng_key, dropout_key = jrandom.split(rng_key)
-
-                # Train step
-                params, opt_state, loss = train_step(
-                    params, opt_state,
-                    (batch_obs, batch_adv, batch_weights),
-                    dropout_key,
-                    network, optimizer,
+            # Get or create multi-step train function
+            cache_key = (id(network), id(optimizer), train_steps_per_iter)
+            if cache_key not in _TRAIN_CACHE:
+                _TRAIN_CACHE[cache_key] = _make_multi_step_train(
+                    network, optimizer, train_steps_per_iter
                 )
-                iter_losses.append(float(loss))
+            multi_train = _TRAIN_CACHE[cache_key]
 
-        avg_loss = np.mean(iter_losses) if iter_losses else 0.0
+            # Sample all batches at once (single memory access + single CPU→GPU transfer)
+            batches = memory.sample_multi_batch(train_steps_per_iter, batch_size, rng)
+
+            # Run all train steps in JIT-compiled loop
+            rng_key, train_key = jrandom.split(rng_key)
+            params, opt_state, avg_loss = multi_train(
+                params, opt_state, batches, train_key
+            )
+            avg_loss = float(avg_loss)
         train_losses.append(avg_loss)
 
         # === Logging ===
@@ -293,7 +339,7 @@ def main():
     parser.add_argument("--train-steps", type=int, default=100, help="Train steps per iteration")
     parser.add_argument("--batch-size", type=int, default=2048, help="Training batch size")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("--memory-size", type=int, default=2_000_000, help="Reservoir memory size")
+    parser.add_argument("--memory-size", type=int, default=10_000_000, help="Reservoir memory size")
     parser.add_argument("--hidden-dims", type=str, default="512,256,128", help="Hidden layer dims")
     parser.add_argument("--checkpoint-every", type=int, default=1000, help="Checkpoint interval")
     parser.add_argument("--log-every", type=int, default=100, help="Log interval")

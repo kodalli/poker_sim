@@ -247,6 +247,205 @@ def batch_traverse_step(
     return next_state, obs, advantages, valid_mask, is_traverser
 
 
+def _make_batch_traverse_jit(network, max_steps: int):
+    """Create JIT-compiled batch traversal with proper MCCFR advantage computation."""
+
+    @partial(jax.jit, static_argnums=())
+    def _batch_traverse_loop(params, state, traverser, rng_key):
+        """Fully JIT-compiled game loop with outcome sampling MCCFR.
+
+        Key fix: Compute counterfactual advantages using terminal rewards
+        and importance weighting, not network predictions.
+        """
+        n_games = state.done.shape[0]
+
+        # Pre-allocate trajectory storage
+        traj_obs = jnp.zeros((n_games, max_steps, OBS_DIM), dtype=jnp.float32)
+        traj_actions = jnp.zeros((n_games, max_steps), dtype=jnp.int32)
+        traj_probs = jnp.ones((n_games, max_steps), dtype=jnp.float32)  # Action probabilities
+        traj_players = jnp.zeros((n_games, max_steps), dtype=jnp.int32)
+        traj_valid = jnp.zeros((n_games, max_steps, NUM_ACTIONS), dtype=jnp.bool_)
+        traj_active = jnp.zeros((n_games, max_steps), dtype=jnp.bool_)  # Was game active at this step
+
+        def body_fn(step_idx, carry):
+            state, traj_obs, traj_actions, traj_probs, traj_players, traj_valid, traj_active, rng_key = carry
+
+            # Split key for this step
+            rng_key, step_key = jrandom.split(rng_key)
+
+            # Get observation and valid actions
+            obs = encode_state_for_current_player(state)
+            valid_mask = get_valid_actions_mask(state)
+
+            # Get strategy from network
+            advantage_pred = network.apply({"params": params}, obs, training=False)
+            strategy = regret_match(advantage_pred, valid_mask)
+
+            # Identify traverser decision points
+            is_traverser = state.current_player == traverser
+
+            # Sample action (with exploration for traverser)
+            rng_key, action_key = jrandom.split(rng_key)
+            explore_prob = 0.3
+            n_valid = jnp.maximum(valid_mask.sum(axis=-1, keepdims=True), 1)
+            uniform = valid_mask.astype(jnp.float32) / n_valid
+            mixed_strategy = jnp.where(
+                is_traverser[:, None],
+                (1 - explore_prob) * strategy + explore_prob * uniform,
+                strategy
+            )
+            actions = sample_action_from_strategy(action_key, mixed_strategy)
+
+            # Get probability of chosen action (from mixed strategy, not pure strategy)
+            game_idx = jnp.arange(n_games)
+            action_probs = mixed_strategy[game_idx, actions]
+
+            # Track if game was active at this step
+            active = ~state.done
+
+            # Step game
+            next_state = step(state, actions)
+
+            # Store in trajectory buffers
+            traj_obs = traj_obs.at[:, step_idx].set(obs)
+            traj_actions = traj_actions.at[:, step_idx].set(actions)
+            traj_probs = traj_probs.at[:, step_idx].set(jnp.where(active, action_probs, 1.0))
+            traj_players = traj_players.at[:, step_idx].set(state.current_player)
+            traj_valid = traj_valid.at[:, step_idx].set(valid_mask)
+            traj_active = traj_active.at[:, step_idx].set(active)
+
+            return (next_state, traj_obs, traj_actions, traj_probs, traj_players, traj_valid, traj_active, rng_key)
+
+        # Run fixed number of steps (JAX requires static loop bounds)
+        init_carry = (state, traj_obs, traj_actions, traj_probs, traj_players, traj_valid, traj_active, rng_key)
+        final_carry = jax.lax.fori_loop(0, max_steps, body_fn, init_carry)
+        final_state, traj_obs, traj_actions, traj_probs, traj_players, traj_valid, traj_active, _ = final_carry
+
+        # Get terminal rewards
+        rewards = get_rewards(final_state)  # [N, 2]
+
+        return final_state, rewards, traj_obs, traj_actions, traj_probs, traj_players, traj_valid, traj_active, traverser
+
+    return _batch_traverse_loop
+
+
+def _compute_cfr_advantages(
+    rewards: np.ndarray,
+    traj_obs: np.ndarray,
+    traj_actions: np.ndarray,
+    traj_probs: np.ndarray,
+    traj_players: np.ndarray,
+    traj_valid: np.ndarray,
+    traj_active: np.ndarray,
+    traverser: np.ndarray,
+    network,
+    params: dict,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute proper counterfactual advantages using outcome sampling MCCFR.
+
+    Vectorized implementation for performance.
+
+    Args:
+        rewards: [N, 2] terminal rewards for each player
+        traj_obs: [N, T, OBS_DIM] observations at each step
+        traj_actions: [N, T] actions taken
+        traj_probs: [N, T] probability of action taken
+        traj_players: [N, T] which player acted
+        traj_valid: [N, T, NUM_ACTIONS] valid action masks
+        traj_active: [N, T] whether game was active
+        traverser: [N] which player we're computing advantages for
+        network: AdvantageNetwork module
+        params: Network parameters
+
+    Returns:
+        observations: [M, OBS_DIM] collected observations
+        advantages: [M, NUM_ACTIONS] counterfactual advantages
+        valid_masks: [M, NUM_ACTIONS] valid action masks
+    """
+    n_games, max_steps = traj_actions.shape
+
+    # Get traverser utility
+    traverser_utility = rewards[np.arange(n_games), traverser]  # [N]
+
+    # Compute cumulative log probabilities for importance weighting
+    log_probs = np.log(traj_probs + 1e-9)  # [N, T]
+
+    # Opponent mask: 1 where opponent acted, 0 where traverser acted
+    is_opponent = (traj_players != traverser[:, None]).astype(np.float32)  # [N, T]
+
+    # Cumulative opponent reach (product of opponent's action probs up to each step)
+    opponent_log_reach = np.cumsum(log_probs * is_opponent, axis=1)  # [N, T]
+
+    # Shift opponent reach by 1 (reach at step t uses probs up to t-1)
+    opponent_log_reach_shifted = np.zeros_like(opponent_log_reach)
+    opponent_log_reach_shifted[:, 1:] = opponent_log_reach[:, :-1]
+
+    # Total sample probability (product of all probs)
+    total_log_prob = np.sum(log_probs * traj_active.astype(np.float32), axis=1)  # [N]
+
+    # Identify all traverser decision points: [N, T]
+    is_traverser_turn = traj_players == traverser[:, None]
+    collect_mask = is_traverser_turn & traj_active  # [N, T]
+
+    # Flatten to get all decision points
+    flat_mask = collect_mask.ravel()  # [N*T]
+    n_samples = flat_mask.sum()
+
+    if n_samples == 0:
+        return (
+            np.zeros((0, OBS_DIM), dtype=np.float32),
+            np.zeros((0, NUM_ACTIONS), dtype=np.float32),
+            np.zeros((0, NUM_ACTIONS), dtype=np.bool_),
+        )
+
+    # Extract data for all traverser decision points at once
+    all_obs = traj_obs.reshape(n_games * max_steps, -1)[flat_mask]  # [M, OBS_DIM]
+    all_actions = traj_actions.ravel()[flat_mask]  # [M]
+    all_valid = traj_valid.reshape(n_games * max_steps, -1)[flat_mask]  # [M, NUM_ACTIONS]
+
+    # Broadcast utility to all timesteps then filter
+    utility_broadcast = np.repeat(traverser_utility, max_steps)  # [N*T]
+    all_utility = utility_broadcast[flat_mask]  # [M]
+
+    # Importance weights
+    opp_reach_flat = opponent_log_reach_shifted.ravel()[flat_mask]  # [M]
+    total_prob_broadcast = np.repeat(total_log_prob, max_steps)  # [N*T]
+    total_prob_flat = total_prob_broadcast[flat_mask]  # [M]
+    importance_weight = np.exp(opp_reach_flat - total_prob_flat)
+    importance_weight = np.clip(importance_weight, 0, 100)  # Clip for stability
+
+    # Get current strategy for ALL observations at once (single batch network call)
+    all_obs_jax = jnp.array(all_obs)
+    all_valid_jax = jnp.array(all_valid)
+    adv_pred = network.apply({"params": params}, all_obs_jax, training=False)
+    strategy = np.array(regret_match(adv_pred, all_valid_jax))  # [M, NUM_ACTIONS]
+
+    # Counterfactual regret computation
+    baseline = 0.0  # Pure outcome sampling
+    regret_contribution = (all_utility - baseline) * importance_weight  # [M]
+
+    # Create action one-hot
+    action_onehot = np.eye(NUM_ACTIONS, dtype=np.float32)[all_actions]  # [M, NUM_ACTIONS]
+
+    # Regret for taken action: positive contribution
+    regret_for_taken = action_onehot * regret_contribution[:, None]  # [M, NUM_ACTIONS]
+
+    # Regret for other actions: negative, weighted by strategy
+    regret_for_others = -strategy * regret_contribution[:, None]  # [M, NUM_ACTIONS]
+
+    # Net advantage: taken action gets positive, others get negative (except taken)
+    advantages = regret_for_taken + regret_for_others * (1 - action_onehot)
+
+    # Mask invalid actions
+    advantages = advantages * all_valid.astype(np.float32)
+
+    return all_obs, advantages.astype(np.float32), all_valid
+
+
+# Cache compiled functions
+_TRAVERSE_CACHE = {}
+
+
 def batch_traverse(
     network,
     params: dict,
@@ -254,15 +453,10 @@ def batch_traverse(
     n_games: int,
     max_steps: int = 50,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Perform batch traversal to collect advantage samples.
+    """Perform batch traversal with proper outcome sampling MCCFR.
 
-    Simplified implementation that runs games to completion and
-    uses network predictions as advantage targets (bootstrapped).
-
-    For each game:
-    1. Play to completion with strategy sampling
-    2. At each traverser decision point, record (obs, advantages)
-    3. Advantages come from network prediction (will improve over training)
+    Key fix: Computes counterfactual advantages using terminal rewards
+    and importance weighting, matching the tabular CFR implementation.
 
     Args:
         network: AdvantageNetwork module
@@ -273,9 +467,15 @@ def batch_traverse(
 
     Returns:
         observations: [M, OBS_DIM] collected observations
-        advantages: [M, NUM_ACTIONS] collected advantages
+        advantages: [M, NUM_ACTIONS] counterfactual advantages
         valid_masks: [M, NUM_ACTIONS] valid action masks
     """
+    # Get or create JIT-compiled function
+    cache_key = (id(network), max_steps)
+    if cache_key not in _TRAVERSE_CACHE:
+        _TRAVERSE_CACHE[cache_key] = _make_batch_traverse_jit(network, max_steps)
+    traverse_fn = _TRAVERSE_CACHE[cache_key]
+
     # Initialize games
     rng_key, reset_key = jrandom.split(rng_key)
     state = reset(reset_key, n_games)
@@ -286,46 +486,33 @@ def batch_traverse(
         jnp.ones(n_games - n_games // 2, dtype=jnp.int32)
     ])
 
-    # Storage for collected samples
-    all_obs = []
-    all_advantages = []
-    all_valid_masks = []
+    # Run JIT-compiled game loop
+    result = traverse_fn(params, state, traverser, rng_key)
+    final_state, rewards, traj_obs, traj_actions, traj_probs, traj_players, traj_valid, traj_active, _ = result
 
-    # Run game loop
-    for step_idx in range(max_steps):
-        # Check if all games done
-        if state.done.all():
-            break
+    # Transfer trajectory data to CPU
+    rewards_np = np.array(rewards)
+    traj_obs_np = np.array(traj_obs)
+    traj_actions_np = np.array(traj_actions)
+    traj_probs_np = np.array(traj_probs)
+    traj_players_np = np.array(traj_players)
+    traj_valid_np = np.array(traj_valid)
+    traj_active_np = np.array(traj_active)
+    traverser_np = np.array(traverser)
 
-        # Get observations and advantages for current state
-        rng_key, step_key = jrandom.split(rng_key)
-        next_state, obs, advantages, valid_mask, is_traverser = batch_traverse_step(
-            state, params, network, step_key, traverser
-        )
-
-        # Only collect samples for non-done traverser decision points
-        collect_mask = is_traverser & ~state.done
-
-        if collect_mask.any():
-            # Extract samples where mask is True
-            indices = jnp.where(collect_mask)[0]
-            all_obs.append(np.array(obs[indices]))
-            all_advantages.append(np.array(advantages[indices]))
-            all_valid_masks.append(np.array(valid_mask[indices]))
-
-        state = next_state
-
-    # Concatenate all samples
-    if all_obs:
-        observations = np.concatenate(all_obs, axis=0)
-        advantages = np.concatenate(all_advantages, axis=0)
-        valid_masks = np.concatenate(all_valid_masks, axis=0)
-    else:
-        observations = np.zeros((0, OBS_DIM), dtype=np.float32)
-        advantages = np.zeros((0, NUM_ACTIONS), dtype=np.float32)
-        valid_masks = np.zeros((0, NUM_ACTIONS), dtype=np.bool_)
-
-    return observations, advantages, valid_masks
+    # Compute proper CFR advantages using terminal rewards
+    return _compute_cfr_advantages(
+        rewards_np,
+        traj_obs_np,
+        traj_actions_np,
+        traj_probs_np,
+        traj_players_np,
+        traj_valid_np,
+        traj_active_np,
+        traverser_np,
+        network,
+        params,
+    )
 
 
 def traverse_with_outcome_values(
@@ -337,13 +524,7 @@ def traverse_with_outcome_values(
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Traverse games and compute advantages using outcome values.
 
-    This is a more accurate (but slower) implementation that:
-    1. Plays games to completion
-    2. Uses actual outcomes to estimate action values
-    3. Computes advantages as action_value - expected_value
-
-    The key insight is that for outcome sampling, we weight the
-    terminal utility by importance sampling ratios.
+    Optimized: keeps data on GPU during loop, single transfer at end.
 
     Args:
         network: AdvantageNetwork module
@@ -367,17 +548,19 @@ def traverse_with_outcome_values(
         jnp.ones(n_games - n_games // 2, dtype=jnp.int32)
     ])
 
-    # Trajectory storage
-    traj_obs = []
-    traj_actions = []
-    traj_probs = []
-    traj_players = []
-    traj_valid_masks = []
+    # Pre-allocate trajectory storage ON GPU
+    traj_obs = jnp.zeros((n_games, max_steps, OBS_DIM), dtype=jnp.float32)
+    traj_actions = jnp.zeros((n_games, max_steps), dtype=jnp.int32)
+    traj_players = jnp.zeros((n_games, max_steps), dtype=jnp.int32)
+    traj_valid_masks = jnp.zeros((n_games, max_steps, NUM_ACTIONS), dtype=jnp.bool_)
+    traj_valid_step = jnp.zeros((n_games, max_steps), dtype=jnp.bool_)
 
-    # Run game loop
+    # Run game loop - keep everything on GPU
+    actual_steps = 0
     for step_idx in range(max_steps):
         if state.done.all():
             break
+        actual_steps = step_idx + 1
 
         # Get observation, strategy, actions
         obs = encode_state_for_current_player(state)
@@ -389,23 +572,21 @@ def traverse_with_outcome_values(
         rng_key, action_key = jrandom.split(rng_key)
         actions = sample_action_from_strategy(action_key, strategy)
 
-        # Record trajectory data
-        action_probs = strategy[jnp.arange(n_games), actions]
-
-        traj_obs.append(np.array(obs))
-        traj_actions.append(np.array(actions))
-        traj_probs.append(np.array(action_probs))
-        traj_players.append(np.array(state.current_player))
-        traj_valid_masks.append(np.array(valid_mask))
+        # Record trajectory data ON GPU (no CPU transfer)
+        not_done = ~state.done
+        traj_obs = traj_obs.at[:, step_idx].set(obs)
+        traj_actions = traj_actions.at[:, step_idx].set(actions)
+        traj_players = traj_players.at[:, step_idx].set(state.current_player)
+        traj_valid_masks = traj_valid_masks.at[:, step_idx].set(valid_mask)
+        traj_valid_step = traj_valid_step.at[:, step_idx].set(not_done)
 
         # Step
         state = step(state, actions)
 
     # Get terminal rewards
     rewards = np.array(get_rewards(state))  # [N, 2]
+    T = actual_steps
 
-    # Convert trajectory to arrays
-    T = len(traj_obs)
     if T == 0:
         return (
             np.zeros((0, OBS_DIM), dtype=np.float32),
@@ -413,74 +594,66 @@ def traverse_with_outcome_values(
             np.zeros((0, NUM_ACTIONS), dtype=np.bool_),
         )
 
-    traj_obs = np.stack(traj_obs, axis=1)  # [N, T, OBS_DIM]
-    traj_actions = np.stack(traj_actions, axis=1)  # [N, T]
-    traj_probs = np.stack(traj_probs, axis=1)  # [N, T]
-    traj_players = np.stack(traj_players, axis=1)  # [N, T]
-    traj_valid_masks = np.stack(traj_valid_masks, axis=1)  # [N, T, NUM_ACTIONS]
+    # Single GPU→CPU transfer for all trajectory data
+    traj_obs_np = np.array(traj_obs[:, :T])  # [N, T, OBS_DIM]
+    traj_actions_np = np.array(traj_actions[:, :T])  # [N, T]
+    traj_players_np = np.array(traj_players[:, :T])  # [N, T]
+    traj_valid_np = np.array(traj_valid_masks[:, :T])  # [N, T, NUM_ACTIONS]
+    traj_valid_step_np = np.array(traj_valid_step[:, :T])  # [N, T]
+    traverser_np = np.array(traverser)  # [N]
 
-    # Compute advantages using outcome sampling
-    # For each traverser decision point:
-    # advantage[a] = (utility_if_took_a - baseline) * importance_weight
+    # Vectorized advantage computation (all NumPy now)
+    # Create mask for traverser decision points: [N, T]
+    is_traverser_turn = traj_players_np == traverser_np[:, None]
+    collect_mask = is_traverser_turn & traj_valid_step_np  # [N, T]
 
-    all_obs = []
-    all_advantages = []
-    all_valid_masks = []
+    # Get traverser utilities: [N]
+    traverser_utility = rewards[np.arange(n_games), traverser_np]
 
-    traverser_np = np.array(traverser)
+    # Flatten to get all traverser decision points
+    flat_mask = collect_mask.ravel()  # [N*T]
+    n_samples = flat_mask.sum()
 
-    for game_idx in range(n_games):
-        trav = traverser_np[game_idx]
-        utility = rewards[game_idx, trav]
+    if n_samples == 0:
+        return (
+            np.zeros((0, OBS_DIM), dtype=np.float32),
+            np.zeros((0, NUM_ACTIONS), dtype=np.float32),
+            np.zeros((0, NUM_ACTIONS), dtype=np.bool_),
+        )
 
-        # Find traverser decision points
-        for t in range(T):
-            if traj_players[game_idx, t] != trav:
-                continue
+    # Extract data for traverser decision points
+    # Reshape to [N*T, ...] then filter
+    flat_obs = traj_obs_np.reshape(n_games * T, OBS_DIM)[flat_mask]  # [M, OBS_DIM]
+    flat_actions = traj_actions_np.ravel()[flat_mask]  # [M]
+    flat_valid = traj_valid_np.reshape(n_games * T, NUM_ACTIONS)[flat_mask]  # [M, NUM_ACTIONS]
 
-            obs = traj_obs[game_idx, t]
-            action_taken = traj_actions[game_idx, t]
-            valid_mask = traj_valid_masks[game_idx, t]
+    # Get utility for each sample (broadcast game utility to all timesteps)
+    utility_per_step = np.repeat(traverser_utility, T)  # [N*T]
+    flat_utility = utility_per_step[flat_mask]  # [M]
 
-            # Compute importance weight: product of opponent probs / product of all probs
-            # For simplicity, use uniform weight here
-            importance_weight = 1.0
+    # Compute strategy for all observations at once (batch network call)
+    flat_obs_jax = jnp.array(flat_obs)
+    flat_valid_jax = jnp.array(flat_valid)
+    adv_pred = network.apply({"params": params}, flat_obs_jax, training=False)
+    strategy = np.array(regret_match(adv_pred, flat_valid_jax))  # [M, NUM_ACTIONS]
 
-            # Get current strategy for this observation
-            obs_batch = obs[None, :]
-            valid_batch = valid_mask[None, :]
-            adv_pred = network.apply({"params": params}, obs_batch, training=False)
-            strategy = np.array(regret_match(jnp.array(adv_pred), jnp.array(valid_batch))[0])
+    # Compute advantages vectorized
+    # baseline = utility * sum(strategy[valid])
+    valid_strategy_sum = (strategy * flat_valid).sum(axis=1)  # [M]
+    baseline = flat_utility * valid_strategy_sum  # [M]
 
-            # Baseline is expected value under strategy
-            # Approximate with utility (since we sampled this trajectory)
-            baseline = utility * np.sum(strategy[valid_mask])
+    # Create action one-hot for taken actions
+    action_onehot = np.eye(NUM_ACTIONS, dtype=np.float32)[flat_actions]  # [M, NUM_ACTIONS]
 
-            # Advantage for taken action
-            advantages = np.zeros(NUM_ACTIONS, dtype=np.float32)
+    # Advantage for taken action: (utility - baseline)
+    # Advantage for other valid actions: -strategy[a] * utility
+    taken_advantage = (flat_utility - baseline)[:, None] * action_onehot  # [M, NUM_ACTIONS]
+    other_advantage = -strategy * flat_utility[:, None]  # [M, NUM_ACTIONS]
 
-            # Simple advantage: utility - baseline for taken action
-            # For other actions, use negative of strategy-weighted baseline
-            for a in range(NUM_ACTIONS):
-                if valid_mask[a]:
-                    if a == action_taken:
-                        advantages[a] = (utility - baseline) * importance_weight
-                    else:
-                        # Counterfactual: what if we took action a instead?
-                        # Approximate with negative contribution
-                        advantages[a] = -strategy[a] * utility * importance_weight
+    # Combine: use taken_advantage where action was taken, other_advantage otherwise
+    advantages = np.where(action_onehot > 0, taken_advantage, other_advantage)
 
-            all_obs.append(obs)
-            all_advantages.append(advantages)
-            all_valid_masks.append(valid_mask)
+    # Mask invalid actions
+    advantages = advantages * flat_valid
 
-    if all_obs:
-        observations = np.stack(all_obs)
-        advantages = np.stack(all_advantages)
-        valid_masks = np.stack(all_valid_masks)
-    else:
-        observations = np.zeros((0, OBS_DIM), dtype=np.float32)
-        advantages = np.zeros((0, NUM_ACTIONS), dtype=np.float32)
-        valid_masks = np.zeros((0, NUM_ACTIONS), dtype=np.bool_)
-
-    return observations, advantages, valid_masks
+    return flat_obs, advantages.astype(np.float32), flat_valid

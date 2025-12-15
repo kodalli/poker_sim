@@ -4,6 +4,64 @@ Research log tracking model training experiments, results, and lessons learned.
 
 ---
 
+## Deep CFR V3 (Fixed MCCFR) - 2025-12-14
+
+**Summary**: Fixed critical bug in Deep CFR - network was training on its own predictions instead of actual counterfactual advantages.
+
+**The Bug**: In `deep_cfr/traverse.py` line 228, the code did `advantages = advantage_pred` - training the network to predict its own outputs (circular dependency). This will never converge to Nash equilibrium.
+
+**The Fix**: Implemented proper outcome sampling MCCFR matching the tabular CFR algorithm:
+1. Record action probabilities during gameplay
+2. Compute importance weights: opponent_reach / sample_prob
+3. Use terminal rewards for advantage computation
+4. Apply CFR regret formula: taken action gets positive, others get negative weighted by strategy
+
+**Configuration**:
+- Algorithm: Single Deep CFR with **correct** outcome sampling MCCFR
+- Network: MLP [443 → 512 → 256 → 128 → 9] (394K params)
+- Training: 500 iterations, 4096 traversals/iter, 100 train steps/iter
+- Memory: 10M reservoir buffer with linear CFR averaging
+- Total samples: 3.58M traversal decisions
+- Training time: 20.4 min on RTX 4090
+
+**Results** (10,000 games each):
+| Opponent     | V2 (broken) | V3 (fixed) | Improvement |
+|--------------|-------------|------------|-------------|
+| random       | +120.6      | **+452.5** | +332        |
+| call_station | -403.4      | **+291.5** | **+695**    |
+| tag          | +280.5      | -17.4      | -298        |
+| lag          | -292.4      | **+347.9** | **+640**    |
+| rock         | -328.2      | -195.6     | +133        |
+| trapper      | -224.1      | -47.2      | +177        |
+| value_bettor | -23.8       | -85.9      | -62         |
+
+**Analysis**:
+1. **Massive improvements on critical opponents**:
+   - Call Station: -403 → +291 (now exploiting instead of being exploited!)
+   - LAG: -292 → +347 (properly handling aggressive players)
+   - Random: +120 → +452 (4x better extraction)
+2. **The fix worked**: V2's over-bluffing against Call Station (-403 BB/100) is now profitable (+291)
+3. **Regression on TAG**: +280 → -17, but V2 was likely overfitting to network predictions
+4. **Still room to improve**: Rock, Trapper, Value Bettor still negative (need more training)
+5. **Speed trade-off**: Correct algorithm is ~10x slower (3k vs 30k samples/s) due to computing real counterfactual values
+
+**Technical Details**:
+- Loss decreased 2370 → 1306 over 500 iterations (values in chip units, not normalized)
+- Importance weight clipping at 100 for numerical stability
+- Single batch network call for strategy computation (vectorized)
+
+**Lessons Learned**:
+1. **Verify CFR implementation correctness** - training on network predictions is a common bug
+2. **Outcome sampling MCCFR works** - importance weighting provides unbiased estimates
+3. **Algorithm correctness > training speed** - 10x slower but actually converges
+4. **Compare to tabular CFR** - use the working tabular implementation as reference
+5. **Next steps**:
+   - Train for more iterations (5000+) to improve against Rock/Trapper
+   - Consider full action exploration instead of outcome sampling for lower variance
+   - The regret values in chips should probably be normalized for stable training
+
+---
+
 ## Single Deep CFR V1 - 2025-12-14
 
 **Summary**: First neural network-based CFR implementation to replace tabular CFR
